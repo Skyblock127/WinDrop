@@ -36,18 +36,16 @@ std::map<std::wstring, ULONGLONG> gRejectedUntil;  // by Wi-Fi Direct name; unde
 
 // Drops a half-made pairing so the next attempt starts clean. A good pairing is kept: re-pairing
 // on every link cost ~4.5 s, and the phone asks for temporary groups, so no invitations follow.
+// Runs on the Accept() thread, so it's done before the publisher is refreshed for the retry.
 void Unpair(winrt::hstring id) {
   if (id.empty()) return;
-  std::thread([id] {
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    try {
-      auto info = DeviceInformation::CreateFromIdAsync(id).get();
-      if (info.Pairing().IsPaired()) Log("wfd: unpair %d", (int)info.Pairing().UnpairAsync().get().Status());
-    } catch (winrt::hresult_error const& ex) {
-      // Temporary groups leave no device record behind: nothing to unpair.
-      if (ex.code() != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) Log("wfd: unpair failed 0x%08x", (unsigned)ex.code());
-    }
-  }).detach();
+  try {
+    auto info = DeviceInformation::CreateFromIdAsync(id).get();
+    if (info.Pairing().IsPaired()) Log("wfd: unpair %d", (int)info.Pairing().UnpairAsync().get().Status());
+  } catch (winrt::hresult_error const& ex) {
+    // Temporary groups leave no device record behind: nothing to unpair.
+    if (ex.code() != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) Log("wfd: unpair failed 0x%08x", (unsigned)ex.code());
+  }
 }
 
 void DropPeer() {
@@ -73,6 +71,7 @@ bool HavePairedPhone() {
 // bring the link up. Windows can't tell who is asking, so the link alone grants nothing: a link
 // that doesn't pass WinDrop's key check within a few seconds is dropped (see LinkUp).
 void Accept(WiFiDirectConnectionRequest const& req) {
+  ULONGLONG began = GetTickCount64();
   gAccepting++;
   struct Done { ~Done() { gAccepting--; } } done;
   auto info = req.DeviceInformation();
@@ -162,11 +161,13 @@ void Accept(WiFiDirectConnectionRequest const& req) {
       gPeerIp = ip;
       gPeerName = std::wstring(info.Name());
     }
-    TheWifiDirect().LinkUp();
+    TheWifiDirect().LinkUp(began, ip);
     // Push queued items now instead of waiting for the phone to say something over the new link.
     if (auto cb = TheWifiDirect().onLinkUp) cb();
   } catch (winrt::hresult_error const& ex) {
     Log("wfd: accept failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
+    Unpair(info.Id());
+    TheWifiDirect().Refresh();
   }
 }
 
@@ -178,12 +179,23 @@ WifiDirectHost& TheWifiDirect() {
 }
 
 
-void WifiDirectHost::LinkUp() {
-  uint64_t seq = ++linkSeq_;
+void WifiDirectHost::LinkUp(ULONGLONG since, const std::string& ip) {
+  uint64_t seq;
+  {
+    // The phone can get its address and connect before Accept() gets here.
+    std::lock_guard<std::mutex> lk(mx_);
+    seq = ++linkSeq_;
+    if (lastAuthIp_ == ip && lastAuthAt_ >= since) {
+      authedSeq_ = seq;
+      authedPhone_ = lastAuthPhone_;
+    }
+    if (lastSawIp_ == ip && lastSawAt_ >= since) sawConnSeq_ = seq;
+  }
   std::thread([this, seq] {
     Sleep(kAuthGraceMs);
-    // A pairing phone proves itself only once the user clicks Yes, which can take up to a minute.
-    while (linkSeq_ == seq && authedSeq_ != seq && pairExchanges > 0) Sleep(500);
+    // A pairing phone proves itself only once the user clicks Yes, which can take up to a minute;
+    // a transfer in progress is a proven phone.
+    while (linkSeq_ == seq && authedSeq_ != seq && (pairExchanges > 0 || busy > 0)) Sleep(500);
     if (linkSeq_ == seq && authedSeq_ != seq && !PeerIp().empty()) {
       if (sawConnSeq_ != seq) {
         Log("wfd: the phone never connected over the link: a firewall or antivirus on this PC is probably blocking WinDrop");
@@ -195,12 +207,20 @@ void WifiDirectHost::LinkUp() {
   }).detach();
 }
 
+// Both take mx_ before reading the peer (same order as Status()), so LinkUp can't slip in between.
 void WifiDirectHost::SawConnection(const std::string& ip) {
+  std::lock_guard<std::mutex> lk(mx_);
+  lastSawIp_ = ip;
+  lastSawAt_ = GetTickCount64();
   if (!ip.empty() && ip == PeerIp()) sawConnSeq_ = linkSeq_.load();
 }
 
-void WifiDirectHost::MarkAuthenticated(const std::string& phoneId) {
+void WifiDirectHost::MarkAuthenticated(const std::string& phoneId, const std::string& ip) {
   std::lock_guard<std::mutex> lk(mx_);
+  lastAuthIp_ = ip;
+  lastAuthPhone_ = phoneId;
+  lastAuthAt_ = GetTickCount64();
+  if (ip != PeerIp()) return;  // not over the link (or the link isn't registered yet: see LinkUp)
   authedSeq_ = linkSeq_.load();
   authedPhone_ = phoneId;
 }
@@ -265,7 +285,9 @@ void WifiDirectHost::SetBeacon(Beacon mode, const std::string& phoneId) {
   std::lock_guard<std::mutex> lk(mx_);
   int64_t window = BeaconWindow();
   if (mode == beacon_ && (mode != kBeaconPending || (window == beaconWindow_ && phoneId == beaconPhone_))) return;
-  bool entering = mode != beacon_ || phoneId != beaconPhone_;
+  // Taking turns between pairing and calling the same phone isn't news: no refresh, no log.
+  bool turn = beacon_ != kBeaconOff && mode != kBeaconOff && phoneId == beaconPhone_;
+  bool entering = (mode != beacon_ || phoneId != beaconPhone_) && !turn;
   beacon_ = mode;
   beaconWindow_ = window;
   beaconPhone_ = phoneId;

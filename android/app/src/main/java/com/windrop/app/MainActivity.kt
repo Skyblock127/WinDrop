@@ -41,6 +41,7 @@ class MainActivity : Activity() {
     private lateinit var permBtn: Button
     private lateinit var overlayBtn: Button
     private lateinit var batteryBtn: Button
+    private lateinit var locationBtn: Button
     private lateinit var outboxCard: LinearLayout
     private lateinit var outboxNote: TextView
     private lateinit var outboxList: LinearLayout
@@ -155,31 +156,17 @@ class MainActivity : Activity() {
             if (!prefs.enabled || WinDropService.instance == null) WinDropService.start(this)
             pairingNow = true
             renderPair()
-            withService { svc ->
-                var sasDialog: android.app.AlertDialog? = null
-                svc.startPairing(onSas = { sas ->
-                    sasDialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                        .setTitle("Pairing with ${prefs.pcP2pName}")
-                        .setMessage("Check that your PC shows the same number:\n\n        ${sas.take(3)} ${sas.drop(3)}\n\nThen click Yes on the PC.")
-                        .setCancelable(false)
-                        .show()
-                }, onDone = { ok, msg ->
-                    sasDialog?.dismiss()
-                    pairingNow = false
-                    render()
-                    android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                        .setTitle(if (ok) "Paired" else "Not paired")
-                        .setMessage(if (ok) "$msg. Transfers are encrypted from now on." else msg)
-                        .setPositiveButton("OK", null)
-                        .show()
-                })
-            }
+            withService { svc -> followPairing(svc) }
         }
 
         // ---- only when something is missing
         setupCard = card(col)
         setupCard.addView(label("NEEDS YOUR OK", 12f, AMBER, bold = true).apply { letterSpacing = 0.08f })
         permBtn = button("Notifications, Nearby devices, Bluetooth", setupCard, filled = false) { requestRuntimePermissions() }
+        // Android 10 and 11 find no Bluetooth or Wi-Fi Direct devices while Location is off.
+        locationBtn = button("Turn on Location (needed to find the PC)", setupCard, filled = false) {
+            runCatching { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
+        }
         overlayBtn = button("Show the pill over other apps", setupCard, filled = false) {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         }
@@ -357,6 +344,8 @@ class MainActivity : Activity() {
         outbox.listeners += refresh
         // Coming back from the overlay settings: attach the pill now that it's allowed.
         if (prefs.enabled && Settings.canDrawOverlays(this)) WinDropService.start(this)
+        // Reopened while pairing runs: show it here, and its result when it ends.
+        WinDropService.instance?.takeIf { it.isPairing && !pairingNow }?.let { pairingNow = true; followPairing(it) }
         render()
     }
 
@@ -392,6 +381,31 @@ class MainActivity : Activity() {
 
 
     private var pairingNow = false
+    private var sasDialog: android.app.AlertDialog? = null
+
+    /** Starts pairing, or (screen reopened mid-way) takes over showing the one in progress. */
+    private fun followPairing(svc: WinDropService) {
+        svc.startPairing(onSas = { sas ->
+            if (isFinishing || isDestroyed) return@startPairing
+            sasDialog?.dismiss()
+            sasDialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Pairing with ${prefs.pcP2pName}")
+                .setMessage("Check that your PC shows the same number:\n\n        ${sas.take(3)} ${sas.drop(3)}\n\nThen click Yes on the PC.")
+                .setCancelable(false)
+                .show()
+        }, onDone = { ok, msg ->
+            if (isFinishing || isDestroyed) return@startPairing
+            sasDialog?.dismiss()
+            sasDialog = null
+            pairingNow = false
+            render()
+            android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(if (ok) "Paired" else "Not paired")
+                .setMessage(if (ok) "$msg. Transfers are encrypted from now on." else msg)
+                .setPositiveButton("OK", null)
+                .show()
+        })
+    }
 
     /** Runs [f] once the service is up (it was possibly just started). */
     private fun withService(tries: Int = 40, f: (WinDropService) -> Unit) {
@@ -437,10 +451,13 @@ class MainActivity : Activity() {
         val needPerm = missingPermissions().isNotEmpty()
         val needOverlay = !Settings.canDrawOverlays(this)
         val needBattery = !getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        val needLocation = Build.VERSION.SDK_INT <= 30 &&
+            getSystemService(android.location.LocationManager::class.java)?.isLocationEnabled == false
         permBtn.visibility = if (needPerm) View.VISIBLE else View.GONE
+        locationBtn.visibility = if (needLocation) View.VISIBLE else View.GONE
         overlayBtn.visibility = if (needOverlay) View.VISIBLE else View.GONE
         batteryBtn.visibility = if (needBattery) View.VISIBLE else View.GONE
-        setupCard.visibility = if (needPerm || needOverlay || needBattery) View.VISIBLE else View.GONE
+        setupCard.visibility = if (needPerm || needLocation || needOverlay || needBattery) View.VISIBLE else View.GONE
 
         val items = outbox.list()
         outboxCard.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE

@@ -21,8 +21,10 @@ class WifiDirectHost {
   std::wstring Status();
   std::string PeerIp();  // phone's address on the Wi-Fi Direct link, empty when not connected
   void Disconnect();     // tear our side of the link down now (the phone said bye)
-  void LinkUp();         // a link just came up: it has kAuthGraceMs to prove it's a paired phone
-  void MarkAuthenticated(const std::string& phoneId);
+  // A link to `ip` just came up (its request arrived at `since`): it has kAuthGraceMs to prove it's
+  // a paired phone. A proof that raced ahead of this call (from `ip`, after `since`) counts.
+  void LinkUp(ULONGLONG since, const std::string& ip);
+  void MarkAuthenticated(const std::string& phoneId, const std::string& ip);
   std::string LinkedPhone();  // the paired phone on the link, empty if none (or not proven yet)
   // Transfers in progress over the link; a busy link isn't handed to another phone.
   std::atomic<int> busy{0};
@@ -73,6 +75,9 @@ class WifiDirectHost {
   std::atomic<ULONGLONG> pairUntil_{0};
   int64_t beaconWindow_ = 0;
   std::atomic<uint64_t> linkSeq_{0}, authedSeq_{0}, sawConnSeq_{0};
+  // Last proof / connection by address, under mx_ (see LinkUp).
+  std::string lastAuthIp_, lastAuthPhone_, lastSawIp_;
+  ULONGLONG lastAuthAt_ = 0, lastSawAt_ = 0;
   std::atomic<ULONGLONG> prewarmUntil_{0};
 };
 

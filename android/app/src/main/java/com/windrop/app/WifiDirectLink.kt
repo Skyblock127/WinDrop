@@ -50,7 +50,7 @@ class WifiDirectLink(
             Logs.w("p2p connect timed out, retrying")
             connecting = false
             channel?.let { ch -> runCatching { mgr?.cancelConnect(ch, null) } }
-            main.postDelayed({ tryConnect() }, 500)
+            schedule(500)  // as retry, so the link-change callback doesn't start a second search
         } else tryConnect()
     }
 
@@ -93,13 +93,15 @@ class WifiDirectLink(
     private var discoverErrors = 0
 
     fun release() {
-        if (!wanted) return
+        // A group can be up without us wanting it (e.g. found on a service restart): tear it down too.
+        if (!wanted && pcIp == null) return
         Logs.i("p2p released")
         wanted = false
         searching = false
         connecting = false
         main.removeCallbacks(retry)
         main.removeCallbacks(poll)
+        main.removeCallbacks(rediscover)
         main.removeCallbacks(giveUp)
         channel?.let { ch ->
             runCatching { mgr?.stopPeerDiscovery(ch, null) }
@@ -139,6 +141,8 @@ class WifiDirectLink(
         if (!running) return
         running = false
         main.removeCallbacks(retry)
+        main.removeCallbacks(poll)
+        main.removeCallbacks(rediscover)
         runCatching { ctx.unregisterReceiver(receiver) }
         channel?.let { ch -> runCatching { mgr?.removeGroup(ch, null) } }
         channel?.let { ch -> if (Build.VERSION.SDK_INT >= 27) runCatching { ch.close() } }
@@ -271,15 +275,32 @@ class WifiDirectLink(
         // its offers / HELLO. Android doesn't expose the PC's vendor IEs, so a name is all we get.
         val name = prefs.pcP2pName
         if (name.isNotEmpty() && d.deviceName.startsWith(name, ignoreCase = true)) return true
+        // Pairing: only the PC whose pairing beacon we saw, never the one we were paired with.
+        if (pairingMode) return false
         return prefs.lastPcName.isNotEmpty() && d.deviceName.equals(prefs.lastPcName, ignoreCase = true)
     }
+
+    private var lastPeersLogged = ""
 
     /** Step 2: found it -> push-button connect; the PC accepts on its own and stays group owner. */
     @SuppressLint("MissingPermission")
     private fun onPeers(peers: Collection<WifiP2pDevice>) {
         val ch = channel ?: return
         if (!searching || connecting || pcIp != null) return
-        val pc = peers.firstOrNull { isOurPc(it) } ?: return
+        val pc = peers.firstOrNull { isOurPc(it) }
+        if (pc == null) {
+            // Name mismatches would otherwise be invisible: log what we do see (when it changes).
+            val seen = peers.joinToString { "${it.deviceName} (${it.deviceAddress})" }
+            if (seen.isNotEmpty() && seen != lastPeersLogged) {
+                lastPeersLogged = seen
+                Logs.i("p2p peers seen, none is the PC (${prefs.pcP2pName.ifEmpty { prefs.lastPcName }}): $seen")
+            }
+            return
+        }
+        // connect() stops discovery; stop polling too, or a peers update would connect again.
+        searching = false
+        main.removeCallbacks(poll)
+        main.removeCallbacks(rediscover)
         connecting = true
         Logs.i("p2p found PC ${pc.deviceName} ${pc.deviceAddress}")
         prefs.pcP2pAddress = pc.deviceAddress

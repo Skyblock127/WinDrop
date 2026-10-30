@@ -26,6 +26,7 @@ enum class NetEv {
   Declined,      // name
   Failed,        // name
   PairRequest,   // id, name = phone name, text = 6-digit check number; answer with Decide(id, ...)
+  PairClosed,    // id: that pairing request is over (answered, timed out or replaced); drop its prompt
   PairDone,      // name = phone name, count = 1 on success
   Incompatible,  // the phone's WinDrop speaks another protocol: name = its app version, count = its protocol
 };
@@ -82,7 +83,7 @@ class NetworkEngine {
   void HandleSession(SecureChannel& ch, const std::string& ip, const std::string& phoneId);
   void UsedPhone(const std::string& phoneId);  // remember it as the default target
   void HandOff(const std::string& phoneId);    // ask the phone on the link to let it go
-  void HandlePair(SOCKET c);
+  void HandlePair(SOCKET c, const std::string& ip);
   void PostIncompatible(const PeerVersion& peer);
   void ReceivePhoneLog(SecureChannel& ch, uint64_t size);
   bool WaitDecision(uint64_t* id, int seconds, std::function<void(uint64_t)> post);
@@ -104,7 +105,9 @@ class NetworkEngine {
   std::condition_variable ocv_;
   uint64_t decisionSeq_ = 0;
   uint64_t pendingDecision_ = 0;
+  uint64_t decidedId_ = 0;  // the request decision_ answers
   int decision_ = -1;
+  std::atomic<int> handlers_{0};  // incoming connections being handled
 
   std::mutex tmx_;
   std::condition_variable tcv_;

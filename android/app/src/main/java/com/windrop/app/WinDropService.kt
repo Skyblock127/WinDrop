@@ -125,7 +125,8 @@ class WinDropService : Service() {
         override fun run() {
             if (p2p.connectedIp == null) return
             val idle = System.currentTimeMillis() - lastActivity > LINK_IDLE_MS
-            if (idle && queued.get() == 0 && receiving.get() == 0 && outbox.count == 0) {
+            // Pairing waits up to a minute on the PC's user: that link isn't idle.
+            if (idle && !pairing && queued.get() == 0 && receiving.get() == 0 && outbox.count == 0) {
                 Logs.i("link idle for ${LINK_IDLE_MS / 1000}s, closing")
                 uploadLogs()
                 sender.execute {
@@ -762,40 +763,62 @@ class WinDropService : Service() {
 
     // ---- pairing ----
     @Volatile private var pairing = false
+    val isPairing: Boolean get() = pairing
+    // The screen showing the pairing; a reopened screen takes over (main thread only).
+    private var pairOnSas: (String) -> Unit = {}
+    private var pairOnDone: (Boolean, String) -> Unit = { _, _ -> }
+    private var pairSas: String? = null
 
     /**
      * Pairs with the PC that has "Pair phone…" open: finds it by its pairing beacon, opens the
      * link, runs the key exchange, and shows the check number ([onSas]) while the user confirms
-     * it on the PC. [onDone] runs on the main thread with (success, message).
+     * it on the PC. [onDone] runs on the main thread with (success, message). Called while pairing
+     * is already running, it only hands the callbacks to the caller (a reopened screen).
      */
     fun startPairing(onSas: (String) -> Unit, onDone: (Boolean, String) -> Unit) {
-        if (pairing) return
+        pairOnSas = onSas
+        pairOnDone = onDone
+        if (pairing) { pairSas?.let(onSas); return }
         pairing = true
+        pairSas = null
         Logs.i("pairing started")
-        prefs.pcP2pName = ""      // learn it fresh from the pairing beacon
+        // Learn the name fresh from the pairing beacon; put the old ones back if pairing fails, so
+        // the PC we're already paired with is still found.
+        val oldName = prefs.pcP2pName
+        val oldAddress = prefs.pcP2pAddress
+        prefs.pcP2pName = ""
         prefs.pcP2pAddress = ""
         // A link to some PC may be up already; pairing must open a fresh one to the PC in pairing mode.
+        val hadLink = p2p.connectedIp != null
         main.post { p2p.release() }
         ble.start()
         ble.reset()  // a pairing beacon seen just before the tap must count now
         io.execute {
-            val (ok, msg) = runCatching { pairOverLink(onSas) }.getOrElse { Logs.w("pairing failed", it); false to "Pairing failed: ${it.message}" }
+            val (ok, msg) = runCatching { pairOverLink(hadLink) }.getOrElse { Logs.w("pairing failed", it); false to "Pairing failed: ${it.message}" }
             pairing = false
             p2p.pairingMode = false
+            if (!ok && prefs.pairKey != null) {
+                prefs.pcP2pName = oldName
+                prefs.pcP2pAddress = oldAddress
+            }
             Logs.i("pairing: $msg")
             main.post {
                 if (!ok) p2p.release()  // don't keep chasing a link the next attempt has to start over
-                onDone(ok, msg); updateServiceNotification(); notifyListeners()
+                pairSas = null
+                pairOnDone(ok, msg); updateServiceNotification(); notifyListeners()
             }
         }
     }
 
-    private fun pairOverLink(onSas: (String) -> Unit): Pair<Boolean, String> {
+    private fun pairOverLink(hadLink: Boolean): Pair<Boolean, String> {
         val noPc = "No PC is in pairing mode. On the PC: tray icon \u2192 Pair phone\u2026, then try again."
         // 1. Find a PC with pairing open (its Bluetooth beacon carries its name).
         var deadline = System.currentTimeMillis() + 60_000
         while (prefs.pcP2pName.isEmpty() && System.currentTimeMillis() < deadline && !stopped) Thread.sleep(200)
         if (prefs.pcP2pName.isEmpty()) return false to noPc
+        // The old link's group takes a moment to go; asking for the new link before that can
+        // mistake the dying group for it.
+        if (hadLink) Thread.sleep(1000)
         // 2. Open the Wi-Fi Direct link to it.
         main.post { p2p.pairingMode = true; p2p.want(); showConnecting() }
         deadline = System.currentTimeMillis() + 150_000
@@ -823,7 +846,7 @@ class WinDropService : Service() {
             tune(s)
             s.soTimeout = 75_000  // the PC waits up to a minute for its user to confirm
             val r = try {
-                Pairing.run(s, prefs.deviceId, prefs.deviceName) { sas -> main.post { onSas(sas) } }
+                Pairing.run(s, prefs.deviceId, prefs.deviceName) { sas -> main.post { pairSas = sas; pairOnSas(sas) } }
             } catch (e: Incompatible) {
                 reportIncompatible(e.peer)
                 return false to (if (e.peer.older) "The PC has WinDrop ${e.peer.version}, which can't pair with this app (${Crypto.appVersion}). Update WinDrop on the PC: tray icon → Update."

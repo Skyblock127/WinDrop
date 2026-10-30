@@ -21,6 +21,7 @@ constexpr uint8_t kAccepted = 1, kDeclined = 2, kBusy = 3;
 constexpr uint8_t kAckOk = 0x00, kAckBad = 0xFF;
 constexpr size_t kChunk = 1 << 20;     // big reads/writes: fewer syscalls, full records
 constexpr int kSockBuf = 4 << 20;      // deep socket buffers keep the radio busy
+constexpr int kMaxHandlers = 6;         // incoming connections handled at once
 constexpr uint64_t kMaxText = 16ull << 20;
 
 void PutU16(std::string& b, uint16_t v) { b += char(v >> 8); b += char(v); }
@@ -187,23 +188,26 @@ void NetworkEngine::SendText(const std::string& utf8, std::string phoneId) {
 void NetworkEngine::Decide(uint64_t id, bool accept) {
   std::lock_guard<std::mutex> lk(omx_);
   if (id == pendingDecision_) {
+    decidedId_ = id;
     decision_ = accept ? 1 : 0;
     ocv_.notify_all();
   }
 }
 
-// Asks the UI (via `post`) and waits for Decide(). False on "no" or timeout.
+// Asks the UI (via `post`) and waits for Decide(). False on "no", timeout, or when a newer request
+// replaces this one (the phone gave up and asked again).
 bool NetworkEngine::WaitDecision(uint64_t* id, int seconds, std::function<void(uint64_t)> post) {
   {
     std::lock_guard<std::mutex> lk(omx_);
     *id = pendingDecision_ = ++decisionSeq_;
-    decision_ = -1;
+    ocv_.notify_all();  // wakes a request this one replaces
   }
   post(*id);
   std::unique_lock<std::mutex> lk(omx_);
-  ocv_.wait_for(lk, std::chrono::seconds(seconds), [&] { return decision_ >= 0 || stop_; });
-  bool yes = decision_ == 1;
-  pendingDecision_ = 0;
+  uint64_t me = *id;
+  ocv_.wait_for(lk, std::chrono::seconds(seconds), [&] { return decidedId_ == me || pendingDecision_ != me || stop_; });
+  bool yes = decidedId_ == me && decision_ == 1;
+  if (pendingDecision_ == me) pendingDecision_ = 0;
   return yes;
 }
 
@@ -414,7 +418,7 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
     Log("send: phone at %s failed the pairing check", ip.c_str());
     return Result::Failed;
   }
-  TheWifiDirect().MarkAuthenticated(job.phoneId);
+  TheWifiDirect().MarkAuthenticated(job.phoneId, ip);
   BusyLink busy;
   struct Done {
     std::atomic<ULONGLONG>& t;
@@ -480,17 +484,30 @@ void NetworkEngine::ServerLoop() {
       Sleep(50);
       continue;
     }
+    std::string ip = IpStr(a.sin_addr);
+    // Each connection on its own thread: a pairing prompt waits up to a minute for the user and a
+    // big transfer takes a while; neither may hold up the next connection. Capped, since the port
+    // is open on the local network too.
+    if (handlers_ >= kMaxHandlers) {
+      Log("refused a connection from %s: %d already open", ip.c_str(), kMaxHandlers);
+      closesocket(c);
+      continue;
+    }
+    handlers_++;
     Tune(c);
-    Log("incoming connection from %s", IpStr(a.sin_addr).c_str());
-    TheWifiDirect().SawConnection(IpStr(a.sin_addr));
-    HandleIncoming(c, IpStr(a.sin_addr));
-    // Close politely: closing with the client's bytes still unread sends a reset, which can
-    // swallow our last reply (say, "incompatible version") before the other side reads it.
-    shutdown(c, SD_SEND);
-    SetTimeouts(c, 300);
-    char junk[4096];
-    for (int i = 0; i < 64 && recv(c, junk, sizeof junk, 0) > 0; ++i) {}
-    closesocket(c);
+    Log("incoming connection from %s", ip.c_str());
+    TheWifiDirect().SawConnection(ip);
+    std::thread([this, c, ip] {
+      HandleIncoming(c, ip);
+      // Close politely: closing with the client's bytes still unread sends a reset, which can
+      // swallow our last reply (say, "incompatible version") before the other side reads it.
+      shutdown(c, SD_SEND);
+      SetTimeouts(c, 300);
+      char junk[4096];
+      for (int i = 0; i < 64 && recv(c, junk, sizeof junk, 0) > 0; ++i) {}
+      closesocket(c);
+      handlers_--;
+    }).detach();
   }
 }
 
@@ -509,7 +526,7 @@ void NetworkEngine::HandleIncoming(SOCKET c, const std::string& ip) {
     PostIncompatible(peer);
     return;
   }
-  if (type == kHelloPair) { HandlePair(c); return; }
+  if (type == kHelloPair) { HandlePair(c, ip); return; }
   if (type != kHelloSession) return;
   SecureChannel ch;
   ch.s = c;
@@ -522,7 +539,7 @@ void NetworkEngine::HandleIncoming(SOCKET c, const std::string& ip) {
     if (ip == TheWifiDirect().PeerIp() && TheWifiDirect().LinkedPhone().empty()) TheWifiDirect().RejectPeer();
     return;
   }
-  if (ip == TheWifiDirect().PeerIp()) TheWifiDirect().MarkAuthenticated(peerId);
+  TheWifiDirect().MarkAuthenticated(peerId, ip);
   BusyLink busy;
   HandleSession(ch, ip, peerId);
   lastActivity_ = GetTickCount64();
@@ -640,7 +657,7 @@ void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip, cons
 // Pairing: only while "Pair phone…" is open. Both sides show a 6-digit check number derived from
 // the key exchange; the user confirms here that they match (that is what stops a stranger, or
 // someone in the middle, from pairing).
-void NetworkEngine::HandlePair(SOCKET c) {
+void NetworkEngine::HandlePair(SOCKET c, const std::string& ip) {
   // phone: pub[65] nP[16] idLen id nameLen name
   Bytes pubP(65), nP(16);
   uint8_t idLen = 0, nameLen = 0;
@@ -715,6 +732,10 @@ void NetworkEngine::HandlePair(SOCKET c) {
     e->text = sas;
     Post(e);
   });
+  // Timed out or replaced by a newer request: take the prompt off the screen.
+  auto* closed = new UiEvent{NetEv::PairClosed};
+  closed->id = did;
+  Post(closed);
   Bytes okLabel = Str("WDR2 pc-ok"), phoneLabel = Str("WDR2 phone-ok");
   Bytes msg{uint8_t(yes ? 1 : 2)};
   if (yes) {
@@ -739,7 +760,7 @@ void NetworkEngine::HandlePair(SOCKET c) {
   uint8_t done = 0;
   SendRaw(c, &done, 1);
   Log("pair: paired with %s", name.c_str());
-  TheWifiDirect().MarkAuthenticated(id);
+  TheWifiDirect().MarkAuthenticated(id, ip);
   auto* e = new UiEvent{NetEv::PairDone};
   e->name = wname;
   e->count = 1;
@@ -778,10 +799,11 @@ void NetworkEngine::TickerLoop() {
       waking_ = (i + 1 == waiting.end()) ? waiting.front() : *(i + 1);
       wakingSince_ = now;
     }
-    // Pairing comes first: a phone being paired waits for the pairing beacon and never sees it while
-    // we're calling some other phone about its queue.
+    // Pairing open and a phone to call about its queue: take turns every 5 s, so neither the phone
+    // being paired (waiting for the pairing beacon) nor the queue waits out the 3-minute window.
+    bool showPairing = wfd.Pairing() && (waking_.empty() || (now / 5000) % 2 == 0);
     wfd.SetBeacon(!enabled ? WifiDirectHost::kBeaconOff
-                  : wfd.Pairing() ? WifiDirectHost::kBeaconPresence
+                  : showPairing ? WifiDirectHost::kBeaconPresence
                   : !waking_.empty() ? WifiDirectHost::kBeaconPending
                                      : WifiDirectHost::kBeaconOff,
                   waking_);

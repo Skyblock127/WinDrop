@@ -337,9 +337,21 @@ void SetOn(bool on) {
 // Opens pairing for 3 minutes; the phone finds us by itself, and the user confirms a 6-digit
 // number that both screens show.
 void ShowPairCode() {
+  if (!Cfg().enabled) SetOn(true);  // off, nothing would answer the phone
   TheWifiDirect().OpenPairWindow();
   Log("ui: pairing window opened");
   gOverlay.Notify(L"Pairing is open for 3 minutes", L"On your phone: WinDrop \u2192 Pair with PC");
+}
+
+// The "Pair with ...?" prompt (a MessageBoxW on the UI thread).
+constexpr wchar_t kPairPromptTitle[] = L"WinDrop \u2014 Pair phone";
+bool gPairPromptOpen = false;
+uint64_t gPairPromptId = 0;
+std::unique_ptr<UiEvent> gNextPairRequest;  // arrived while a prompt was open
+
+void ClosePairPrompt() {
+  // Only one prompt is ever open, so the title finds it. EndDialog returns IDNO from MessageBoxW.
+  if (HWND box = FindWindowW(L"#32770", kPairPromptTitle)) EndDialog(box, IDNO);
 }
 
 // ---- updates ----
@@ -569,12 +581,29 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (e->type == NetEv::TextReceived) SetClipboardText(U2W(e->text));
       if (e->type == NetEv::RecvDone && IsClipboardImage(e->name)) SetClipboardImage(e->path);
       if (e->type == NetEv::PairRequest) {
-        // The phone shows the same number; a mismatch means someone is in the middle.
-        std::wstring sas = U2W(e->text);
-        std::wstring msg = L"Pair with \u201C" + e->name + L"\u201D?\n\nCheck that your phone shows the same number:\n\n        " +
-                           sas.substr(0, 3) + L" " + sas.substr(3) + L"\n\nOnly click Yes if the numbers match.";
-        int r = MessageBoxW(gMain, msg.c_str(), L"WinDrop \u2014 Pair phone", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST);
-        gNet.Decide(e->id, r == IDYES);
+        // One prompt at a time: a newer request (the phone asked again) replaces the open one.
+        // Its MessageBoxW is further down this stack, so close it and show the new one from there.
+        if (gPairPromptOpen) {
+          gNextPairRequest = std::move(e);
+          ClosePairPrompt();
+          return 0;
+        }
+        gPairPromptOpen = true;
+        while (e) {
+          gPairPromptId = e->id;
+          // The phone shows the same number; a mismatch means someone is in the middle.
+          std::wstring sas = U2W(e->text);
+          std::wstring msg = L"Pair with \u201C" + e->name + L"\u201D?\n\nCheck that your phone shows the same number:\n\n        " +
+                             sas.substr(0, 3) + L" " + sas.substr(3) + L"\n\nOnly click Yes if the numbers match.";
+          int r = MessageBoxW(gMain, msg.c_str(), kPairPromptTitle, MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST);
+          gNet.Decide(e->id, r == IDYES);  // ignored if that request is already over
+          e = std::move(gNextPairRequest);
+        }
+        gPairPromptOpen = false;
+        return 0;
+      }
+      if (e->type == NetEv::PairClosed) {
+        if (gPairPromptOpen && e->id == gPairPromptId && !gNextPairRequest) ClosePairPrompt();
         return 0;
       }
       if (e->type == NetEv::PairDone) {
