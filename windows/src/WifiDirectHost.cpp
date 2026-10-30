@@ -4,6 +4,8 @@
 #include "Crypto.h"
 #include "Settings.h"
 
+#include <map>
+
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Devices.WiFiDirect.h>
@@ -29,6 +31,8 @@ std::mutex gPeerMx;
 BluetoothLEAdvertisementPublisher gBeacon{nullptr};
 WiFiDirectDevice gPeer{nullptr};  // the link lives as long as this object does
 std::string gPeerIp;
+std::wstring gPeerName;                          // Wi-Fi Direct name of the phone on the link
+std::map<std::wstring, ULONGLONG> gRejectedUntil;  // by Wi-Fi Direct name; under gPeerMx
 
 // Drops a half-made pairing so the next attempt starts clean. A good pairing is kept: re-pairing
 // on every link cost ~4.5 s, and the phone asks for temporary groups, so no invitations follow.
@@ -51,6 +55,7 @@ void DropPeer() {
   if (gPeer) try { gPeer.Close(); } catch (...) {}
   gPeer = nullptr;
   gPeerIp.clear();
+  gPeerName.clear();
 }
 
 winrt::Windows::Storage::Streams::IBuffer Buf(const std::string& s) {
@@ -78,6 +83,15 @@ void Accept(WiFiDirectConnectionRequest const& req) {
     Log("wfd: refused %s: another phone is transferring", W2U(std::wstring(info.Name())).c_str());
     try { req.Close(); } catch (...) {}
     return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(gPeerMx);
+    auto r = gRejectedUntil.find(std::wstring(info.Name()));
+    if (r != gRejectedUntil.end() && GetTickCount64() < r->second && !TheWifiDirect().Pairing()) {
+      Log("wfd: ignored: %s isn't paired here", W2U(std::wstring(info.Name())).c_str());
+      try { req.Close(); } catch (...) {}
+      return;
+    }
   }
   if (!HavePairedPhone() && !TheWifiDirect().Pairing()) {
     Log("wfd: refused: no phone paired and the pairing window is closed");
@@ -135,6 +149,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
       if (gPeer) try { gPeer.Close(); } catch (...) {}
       gPeer = dev;
       gPeerIp = ip;
+      gPeerName = std::wstring(info.Name());
     }
     TheWifiDirect().LinkUp();
     // Push queued items now instead of waiting for the phone to say something over the new link.
@@ -173,6 +188,22 @@ std::string WifiDirectHost::LinkedPhone() {
   if (PeerIp().empty()) return "";
   std::lock_guard<std::mutex> lk(mx_);
   return authedSeq_ == linkSeq_ ? authedPhone_ : "";
+}
+
+void WifiDirectHost::OpenPairWindow() {
+  pairUntil_ = GetTickCount64() + 180000;
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  gRejectedUntil.clear();
+}
+
+void WifiDirectHost::RejectPeer() {
+  {
+    std::lock_guard<std::mutex> lk(gPeerMx);
+    if (gPeerName.empty()) return;
+    gRejectedUntil[gPeerName] = GetTickCount64() + 10 * 60 * 1000;
+    Log("wfd: %s isn't paired here; ignoring it for 10 minutes", W2U(gPeerName).c_str());
+  }
+  Disconnect();
 }
 
 void WifiDirectHost::Disconnect() {

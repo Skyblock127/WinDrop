@@ -514,7 +514,10 @@ void NetworkEngine::HandleIncoming(SOCKET c, const std::string& ip) {
   std::string peerId;
   bool ok = ch.ServerHandshake([](const std::string& id) { return KeyFor(id); }, &peerId);
   if (!ok) {
-    Log("refused a connection from %s: not the paired phone", ip.c_str());
+    Log("refused a connection from %s: not a paired phone", ip.c_str());
+    // A phone this PC no longer has (removed, or paired with another PC) holding the link would
+    // keep the paired phones off it: drop it now and ignore its requests for a while.
+    if (ip == TheWifiDirect().PeerIp() && TheWifiDirect().LinkedPhone().empty()) TheWifiDirect().RejectPeer();
     return;
   }
   if (ip == TheWifiDirect().PeerIp()) TheWifiDirect().MarkAuthenticated(peerId);

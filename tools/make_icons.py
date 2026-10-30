@@ -47,11 +47,10 @@ def tile(logo: Image.Image, size: int, bg, fg=None) -> Image.Image:
     mask = Image.new("L", (big, big), 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, big - 1, big - 1), radius=round(big * 0.22), fill=255)
     out.paste(Image.new("RGBA", (big, big), bg + (255,)), (0, 0), mask)
-    # Small icons: thin strokes vanish, so the swirl gets more of the square and a touch of weight.
-    fill = 0.90 if size <= 24 else 0.84 if size <= 48 else 0.78
+    # Small icons get more of the square. No extra weight: at tray sizes the four strokes would
+    # merge into one blob.
+    fill = 0.96 if size <= 24 else 0.88 if size <= 48 else 0.80
     mark = padded(logo, big, fill)
-    if size <= 32:
-        mark = bolder(mark, max(1, big // 100))
     if fg:
         mark = tinted(mark, fg)
     out.alpha_composite(mark)
@@ -96,23 +95,31 @@ def main():
     for name, k in dens.items():
         d = RES / f"mipmap-{name}"
         d.mkdir(parents=True, exist_ok=True)
-        padded(logo, round(108 * k), 0.64).save(d / "ic_launcher_fg.png")
+        padded(logo, round(108 * k), 0.48).save(d / "ic_launcher_fg.png")
         legacy = Image.new("RGBA", (round(48 * k),) * 2, (255, 255, 255, 0))
         circle = Image.new("L", legacy.size, 0)
         ImageDraw.Draw(circle).ellipse((0, 0, legacy.size[0] - 1, legacy.size[1] - 1), fill=255)
         white = Image.new("RGBA", legacy.size, (255, 255, 255, 255))
         legacy.paste(white, (0, 0), circle)
-        legacy.alpha_composite(padded(logo, legacy.size[0], 0.8))
+        legacy.alpha_composite(padded(logo, legacy.size[0], 0.6))
         legacy.save(d / "ic_launcher.png")
 
-    # Tile + notification glyph: white silhouette, the system tints it.
+    # Notification glyph and Quick Settings tile: white silhouettes, the system tints them.
     for name, k in dens.items():
         d = RES / f"drawable-{name}"
         d.mkdir(parents=True, exist_ok=True)
-        # The swirl is wide and short, so it spans the full width to look as big as other tiles' icons.
         side = round(24 * k)
-        glyph = bolder(padded(logo, side * 4, 1.0), max(1, side * 4 // 160))
+        big = side * 4
+        glyph = bolder(padded(logo, big, 1.0), max(1, big // 160))
         tinted(glyph.resize((side, side), Image.LANCZOS), (255, 255, 255)).save(d / "ic_windrop_glyph.png")
+        # The tile draws its icon in a small square; the swirl is wide and short, so it's drawn 1.3x
+        # the square's width with the left edge in view and the thin tail tips cut off.
+        inner = round(big * 1.3)
+        mark = bolder(logo.resize((inner, inner), Image.LANCZOS), max(1, big // 160))
+        bb = mark.getchannel("A").getbbox()
+        canvas = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        canvas.paste(mark, (round(big * 0.03) - bb[0], (big - inner) // 2), mark)
+        tinted(canvas.resize((side, side), Image.LANCZOS), (255, 255, 255)).save(d / "ic_tile.png")
     print("icons written")
 
 

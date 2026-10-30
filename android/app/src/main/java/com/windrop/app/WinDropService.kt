@@ -442,6 +442,7 @@ class WinDropService : Service() {
             f.deleteOnExit()
         }
         val (s, ch) = try { openChannel() } catch (e: Incompatible) { reportIncompatible(e.peer); return Result.FAILED }
+            catch (e: NotPaired) { forgetPairing(); return Result.FAILED }
             ?: return if (prefs.paired) Result.OFFLINE else Result.FAILED
         s.use {
             val out = ch.output
@@ -502,6 +503,9 @@ class WinDropService : Service() {
         val ch = try {
             SecureChannel.client(s, key, prefs.deviceId)
         } catch (e: Incompatible) {
+            runCatching { s.close() }
+            throw e
+        } catch (e: NotPaired) {
             runCatching { s.close() }
             throw e
         } catch (e: Exception) {
@@ -841,6 +845,22 @@ class WinDropService : Service() {
                 Proto.writeOffer(ch.output, Proto.Offer(Proto.TYPE_BYE, 0, "", prefs.deviceName, prefs.deviceId))
                 ch.input.read()
             }
+        }
+    }
+
+    /** The PC removed this phone: stop calling it and say how to pair again. */
+    private fun forgetPairing() {
+        if (!prefs.paired) return
+        val pc = prefs.pcLabel
+        Logs.w("$pc no longer has this phone paired; forgetting the pairing")
+        prefs.pairKey = null
+        prefs.pairedPcId = ""
+        main.post {
+            p2p.release()
+            ui(Island.Msg("$pc removed this phone", "Pair again from the WinDrop app", Island.G_WARN, Island.AMBER), 5000,
+                "$pc removed this phone. Pair again from the WinDrop app.")
+            updateServiceNotification()
+            notifyListeners()
         }
     }
 

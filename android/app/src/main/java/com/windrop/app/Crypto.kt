@@ -169,6 +169,9 @@ data class PeerVersion(val proto: Int, val version: String) {
     val older: Boolean get() = proto < Crypto.PROTO
 }
 
+/** The PC answered but doesn't know this phone any more (removed there, or paired anew). */
+class NotPaired : java.io.IOException("this PC no longer has this phone paired")
+
 /** The other side runs a WinDrop that speaks a different protocol: one of the two needs updating. */
 class Incompatible(val peer: PeerVersion) : java.io.IOException("WinDrop ${peer.version} (protocol ${peer.proto}) doesn't match ${Crypto.appVersion} (protocol ${Crypto.PROTO})")
 
@@ -273,7 +276,11 @@ class SecureChannel private constructor(socket: Socket, rawIn: InputStream, key:
             val id = myId.toByteArray()
             out.write(Crypto.envelope(Crypto.HELLO_SESSION) + id.size.toByte() + id + nc)
             out.flush()
-            if (Crypto.readStatus(inp) != Crypto.STATUS_GO) return null
+            when (Crypto.readStatus(inp)) {
+                Crypto.STATUS_GO -> Unit
+                Crypto.STATUS_REFUSED -> throw NotPaired()
+                else -> return null
+            }
             val ns = ByteArray(16).also { inp.readFully(it) }
             val macS = ByteArray(32).also { inp.readFully(it) }
             if (!Crypto.same(macS, Crypto.hmac(key, "WDR2 srv".toByteArray(), nc, ns))) return null

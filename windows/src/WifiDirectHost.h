@@ -33,7 +33,9 @@ class WifiDirectHost {
   // Cheap to call every tick; only acts on changes.
   enum Beacon { kBeaconOff, kBeaconPresence, kBeaconPending };
   void SetBeacon(Beacon mode, const std::string& phoneId = "");  // pending: which phone to wake
-  void OpenPairWindow() { pairUntil_ = GetTickCount64() + 180000; }
+  void OpenPairWindow();  // also forgets rejected phones: they may be the one being paired
+  // The phone on the link isn't paired here: drop it and ignore its requests for 10 minutes.
+  void RejectPeer();
   bool Pairing() const { return GetTickCount64() < pairUntil_; }
   // A drag is heading for the pill: wake the phone before the drop so the link is ready by then.
   void Prewarm(const std::string& phoneId) {

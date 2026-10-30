@@ -48,7 +48,7 @@ class WinDropTileService : TileService() {
         t.state = if (on) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         t.label = "WinDrop"
         t.subtitle = if (on) Prefs(this).pcLabel else "Off"
-        t.icon = android.graphics.drawable.Icon.createWithResource(this, R.drawable.ic_windrop_glyph)
+        t.icon = android.graphics.drawable.Icon.createWithResource(this, R.drawable.ic_tile)
         t.updateTile()
     }
 }
