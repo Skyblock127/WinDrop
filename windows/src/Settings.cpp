@@ -2,6 +2,7 @@
 
 #include <shlobj.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <random>
 
@@ -72,10 +73,22 @@ void Settings::Load() {
 
   enabled = ReadIni(L"Enabled", L"1") == L"1";
   pillShown = ReadIni(L"ShowPill", L"1") == L"1";
-  pairedPhoneId = W2U(ReadIni(L"PairedPhoneId"));
-  pairedPhoneName = ReadIni(L"PairedPhoneName");
-  pairKey = UnprotectKey(W2U(ReadIni(L"PairKey")));
-  if (pairKey.size() != 32) { pairKey.clear(); pairedPhoneId.clear(); }  // older, unencrypted pairing: pair again
+  phones.clear();
+  int count = _wtoi(ReadIni(L"PhoneCount", L"0").c_str());
+  for (int i = 0; i < count && phones.size() < kMaxPhones; ++i) {
+    std::wstring k = L"Phone" + std::to_wstring(i);
+    PairedPhone p{W2U(ReadIni((k + L"Id").c_str())), ReadIni((k + L"Name").c_str()),
+                  UnprotectKey(W2U(ReadIni((k + L"Key").c_str())))};
+    if (!p.id.empty() && p.key.size() == 32) phones.push_back(p);
+  }
+  // From 0.1.x, which had a single paired phone.
+  if (count == 0) {
+    PairedPhone p{W2U(ReadIni(L"PairedPhoneId")), ReadIni(L"PairedPhoneName"), UnprotectKey(W2U(ReadIni(L"PairKey")))};
+    if (!p.id.empty() && p.key.size() == 32) phones.push_back(p);
+  }
+  for (auto* k : {L"PairedPhoneId", L"PairedPhoneName", L"PairKey", L"PairCode", L"LastPhoneIp"})
+    WritePrivateProfileStringW(L"WinDrop", k, nullptr, IniPath().c_str());
+  lastPhoneId = W2U(ReadIni(L"LastPhoneId"));
   deviceId = W2U(ReadIni(L"DeviceId"));
   if (deviceId.empty()) {
     std::random_device rd;
@@ -93,13 +106,62 @@ void Settings::Save() {
   std::lock_guard<std::recursive_mutex> lk(CfgMutex());
   WriteIni(L"Enabled", enabled ? L"1" : L"0");
   WriteIni(L"ShowPill", pillShown ? L"1" : L"0");
-  WriteIni(L"PairedPhoneId", U2W(pairedPhoneId));
-  WriteIni(L"PairedPhoneName", pairedPhoneName);
-  WriteIni(L"PairKey", pairKey.empty() ? L"" : U2W(ProtectKey(pairKey)));
+  int old = _wtoi(ReadIni(L"PhoneCount", L"0").c_str());
+  WriteIni(L"PhoneCount", std::to_wstring(phones.size()));
+  for (size_t i = 0; i < std::max<size_t>(phones.size(), (size_t)old); ++i) {
+    std::wstring k = L"Phone" + std::to_wstring(i);
+    bool has = i < phones.size();
+    auto put = [&](const std::wstring& key, const std::wstring& v) {
+      WritePrivateProfileStringW(L"WinDrop", key.c_str(), has ? v.c_str() : nullptr, IniPath().c_str());
+    };
+    put(k + L"Id", has ? U2W(phones[i].id) : L"");
+    put(k + L"Name", has ? phones[i].name : L"");
+    put(k + L"Key", has ? U2W(ProtectKey(phones[i].key)) : L"");
+  }
+  WriteIni(L"LastPhoneId", U2W(lastPhoneId));
   WriteIni(L"DeviceId", U2W(deviceId));
 }
 
-// Outbox file format: one item per line, "F\t<utf8 path>" or "T\t<hex utf8 text>".
+const PairedPhone* Settings::Find(const std::string& id) const {
+  for (auto& p : phones)
+    if (p.id == id) return &p;
+  return nullptr;
+}
+
+void Settings::AddPhone(const PairedPhone& p) {
+  RemovePhone(p.id);
+  phones.push_back(p);
+}
+
+void Settings::RemovePhone(const std::string& id) {
+  phones.erase(std::remove_if(phones.begin(), phones.end(), [&](const PairedPhone& p) { return p.id == id; }), phones.end());
+  if (lastPhoneId == id) lastPhoneId.clear();
+}
+
+std::string Settings::DefaultPhone() const {
+  if (Find(lastPhoneId)) return lastPhoneId;
+  return phones.empty() ? "" : phones.front().id;
+}
+
+std::vector<PairedPhone> Phones() {
+  std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+  return Cfg().phones;
+}
+
+Bytes KeyFor(const std::string& phoneId) {
+  std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+  auto* p = Cfg().Find(phoneId);
+  return p ? p->key : Bytes{};
+}
+
+std::wstring PhoneLabel(const std::string& phoneId) {
+  std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+  auto* p = Cfg().Find(phoneId);
+  return p && !p->name.empty() ? p->name : L"your phone";
+}
+
+// Outbox file format: one item per line, "f\t<phone id>\t<utf8 path>" or "t\t<phone id>\t<hex utf8 text>".
+// 0.1.x wrote "F\t<path>" / "T\t<hex>" with no phone: those go to the default phone.
 void Outbox::Load(const std::wstring& file) {
   std::lock_guard<std::mutex> lk(mx_);
   file_ = file;
@@ -120,8 +182,16 @@ void Outbox::Load(const std::wstring& file) {
     if (line.size() < 3 || line[1] != '\t') continue;
     OutboxItem it;
     it.id = nextId_++;
-    if (line[0] == 'F') it.path = U2W(line.substr(2));
-    else if (line[0] == 'T') { it.isText = true; it.text = Unhex(line.substr(2)); }
+    std::string rest = line.substr(2);
+    char kind = line[0];
+    if (kind == 'f' || kind == 't') {
+      size_t tab = rest.find('\t');
+      if (tab == std::string::npos) continue;
+      it.phoneId = rest.substr(0, tab);
+      rest = rest.substr(tab + 1);
+    }
+    if (kind == 'F' || kind == 'f') it.path = U2W(rest);
+    else if (kind == 'T' || kind == 't') { it.isText = true; it.text = Unhex(rest); }
     else continue;
     items_.push_back(std::move(it));
   }
@@ -131,7 +201,7 @@ void Outbox::SaveLocked() {
   FILE* f = _wfopen(file_.c_str(), L"wb");
   if (!f) return;
   for (auto& it : items_) {
-    std::string line = it.isText ? "T\t" + Hex(it.text) : "F\t" + W2U(it.path);
+    std::string line = (it.isText ? "t\t" : "f\t") + it.phoneId + "\t" + (it.isText ? Hex(it.text) : W2U(it.path));
     line += '\n';
     fwrite(line.data(), 1, line.size(), f);
   }
@@ -158,6 +228,14 @@ void Outbox::Clear() {
   std::lock_guard<std::mutex> lk(mx_);
   items_.clear();
   SaveLocked();
+}
+
+void Outbox::AssignPhone(const std::string& phoneId) {
+  std::lock_guard<std::mutex> lk(mx_);
+  bool changed = false;
+  for (auto& it : items_)
+    if (it.phoneId.empty()) { it.phoneId = phoneId; changed = true; }
+  if (changed) SaveLocked();
 }
 
 std::vector<OutboxItem> Outbox::Snapshot() {

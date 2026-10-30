@@ -126,6 +126,7 @@ HRESULT DropTarget::DragEnter(IDataObject* data, DWORD, POINTL pt, DWORD* effect
 
 HRESULT DropTarget::DragOver(DWORD, POINTL pt, DWORD* effect) {
   *effect = accept_ ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+  if (accept_) overlay_->DragMoved(POINT{pt.x, pt.y});
   if (helper_) {
     POINT p{pt.x, pt.y};
     helper_->DragOver(&p, *effect);

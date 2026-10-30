@@ -78,10 +78,12 @@ Fonts& FontsFor(float s) {
   return f;
 }
 
-std::wstring PhoneName() {
+std::string DefaultPhone() {
   std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-  return Cfg().pairedPhoneName.empty() ? L"your phone" : Cfg().pairedPhoneName;
+  return Cfg().DefaultPhone();
 }
+
+constexpr float kSpotW = 220, kSpotW4 = 196, kSpotGap = 12;  // drop spots, one per phone
 
 bool LooksLikeUrl(const std::wstring& t) {
   return (t.rfind(L"http://", 0) == 0 || t.rfind(L"https://", 0) == 0) && t.find_first_of(L" \r\n\t") == std::wstring::npos;
@@ -283,14 +285,19 @@ void TopOverlay::PollDrag() {
     if (moved && startedBelow && atEdge && !moveSize) {
       monitor_ = mon;
       drag_ = 1;
-      TheWifiDirect().Prewarm();  // start waking the phone while the user is still dragging
+      spotPhones_.clear();
+      if (auto phones = Phones(); phones.size() > 1)
+        for (auto& p : phones) spotPhones_.push_back(p.id);
+      hotSpot_ = -1;
+      spotRects_.clear();
+      TheWifiDirect().Prewarm(DefaultPhone());  // start waking the phone while the user is still dragging
       Log("ui: drag heading for the pill, prewarming link");
       Refresh();
     }
   } else if (drag_ == 1) {
     // Out of the drop band = no pill. Getting it back means touching the top edge again.
     LONG fromCenter = std::abs(pt.x - (mi.rcMonitor.left + mi.rcMonitor.right) / 2);
-    if (fromTop > (LONG)(kBandH * s) || fromCenter > (LONG)(kBandW / 2 * s)) {
+    if (fromTop > (LONG)(kBandH * s) || fromCenter > (LONG)(BandW() / 2 * s)) {
       drag_ = 0;
       Refresh();
     }
@@ -303,6 +310,29 @@ void TopOverlay::DragEntered() {
   Refresh();
 }
 
+// While a drag hovers the spots, light up the one under the cursor and start waking that phone.
+void TopOverlay::DragMoved(POINT pt) {
+  int i = SpotAt(pt);
+  if (i == hotSpot_) return;
+  hotSpot_ = i;
+  if (i >= 0) TheWifiDirect().Prewarm(spotPhones_[i]);
+  look_.hot = i;
+  Render();
+}
+
+int TopOverlay::SpotAt(POINT pt) const {
+  int best = -1;
+  LONG bestD = LONG_MAX;
+  for (size_t i = 0; i < spotRects_.size(); ++i) {
+    const RECT& r = spotRects_[i];
+    LONG d = pt.x < r.left ? r.left - pt.x : pt.x > r.right ? pt.x - r.right : 0;
+    if (d < bestD) { bestD = d; best = (int)i; }
+  }
+  return best;
+}
+
+float TopOverlay::BandW() const { return max(kBandW, look_.w + 60); }
+
 void TopOverlay::DragLeft() {
   oleInside_ = false;
   if (drag_) { drag_ = 1; Refresh(); }
@@ -311,6 +341,13 @@ void TopOverlay::DragLeft() {
 void TopOverlay::Dropped(const std::vector<std::wstring>& files, const std::wstring& text) {
   oleInside_ = false;
   drag_ = 0;
+  TheWifiDirect().EndPrewarm();
+  POINT pt;
+  GetCursorPos(&pt);
+  int spot = SpotAt(pt);
+  std::string phone = spot >= 0 && spot < (int)spotPhones_.size() ? spotPhones_[spot] : DefaultPhone();
+  spotPhones_.clear();
+  spotRects_.clear();
   std::vector<std::wstring> send;
   int dirs = 0;
   for (auto& f : files) {
@@ -318,14 +355,14 @@ void TopOverlay::Dropped(const std::vector<std::wstring>& files, const std::wstr
     if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) ++dirs;
     else send.push_back(f);
   }
-  if (!send.empty()) net_->SendFiles(send);
-  else if (!text.empty()) net_->SendText(W2U(text));
+  if (!send.empty()) net_->SendFiles(send, phone);
+  else if (!text.empty()) net_->SendText(W2U(text), phone);
 
   if (dirs && send.empty()) {
     Notify(L"Folders can't be sent yet", L"Zip the folder, then drop the .zip", true);
   } else {
     Message m;
-    m.title = send.size() > 1 ? L"Sending " + std::to_wstring(send.size()) + L" files…" : L"Sending to " + PhoneName() + L"…";
+    m.title = send.size() > 1 ? L"Sending " + std::to_wstring(send.size()) + L" files to " + PhoneLabel(phone) : L"Sending to " + PhoneLabel(phone) + L"…";
     m.sub = L"Connecting";
     m.glyph = kGlyphUp;
     m.accent = kBlue;
@@ -381,7 +418,7 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       xfer_.active = false;
       Message m;
       m.title = L"Sent " + e.name;
-      m.sub = L"Delivered to " + PhoneName();
+      m.sub = L"Delivered to " + PhoneLabel(e.phone);
       m.glyph = kGlyphCheck;
       m.accent = kGreen;
       ShowMessage(m, 2000);
@@ -416,7 +453,7 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
     case NetEv::Offline: {
       outboxBatch_.push_back(e.id);
       Message m;
-      m.title = L"Connecting to phone\u2026";
+      m.title = L"Connecting to " + PhoneLabel(e.phone) + L"\u2026";
       m.sub = e.count > 1 ? std::to_wstring(e.count) + L" items waiting \u00b7 they send as soon as it connects"
                           : L"Sends as soon as it connects";
       m.glyph = kGlyphUp;
@@ -428,7 +465,7 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
     case NetEv::Declined: {
       xfer_.active = false;
       Message m;
-      m.title = L"Phone declined " + e.name;
+      m.title = PhoneLabel(e.phone) + L" declined " + e.name;
       m.glyph = kGlyphCancel;
       m.accent = kRed;
       ShowMessage(m, 2500);
@@ -495,10 +532,17 @@ void TopOverlay::Refresh() {
     L.h = drag_ == 2 ? 68.f : 64.f;
     L.y = 8;
     L.title = drag_ == 2 ? L"Release to send" : L"Drop to send to phone";
-    L.sub = PhoneName();
+    L.sub = PhoneLabel(DefaultPhone());
     L.glyph = kGlyphUp;
     L.accent = kBlue;
     L.highlight = drag_ == 2;
+    if (!spotPhones_.empty()) {
+      size_t n = spotPhones_.size();
+      for (auto& id : spotPhones_) L.spots.push_back(PhoneLabel(id));
+      L.w = n * (n > 2 ? kSpotW4 : kSpotW) + (n - 1) * kSpotGap;
+      L.h = 64;
+      L.hot = hotSpot_;
+    }
   } else if (offer_.active) {
     L.idle = false;
     L.w = 430;
@@ -597,10 +641,10 @@ void TopOverlay::Render() {
   // with the pill drawn inside it; otherwise it's exactly the pill.
   bool band = drag_ != 0;
   int py = band ? (int)std::lround(cy_ * s) : 0;
-  int WW = band ? max(W, (int)std::lround(kBandW * s)) : W;
+  int WW = band ? max(W, (int)std::lround(BandW() * s)) : W;
   int WH = band ? max(H + py, (int)std::lround(kBandH * s)) : H;
   int px = (WW - W) / 2;
-  int needW = (int)std::ceil(max(460.f, kBandW) * s) + 2, needH = (int)std::ceil(max(90.f, kBandH) * s) + 2;
+  int needW = (int)std::ceil(max(460.f, BandW()) * s) + 2, needH = (int)std::ceil(max(90.f, kBandH) * s) + 2;
   if (needW > dibW_ || needH > dibH_ || !dib_) {
     if (dib_) { SelectObject(memDC_, oldBmp_); DeleteObject(dib_); }
     BITMAPINFO bi{};
@@ -627,6 +671,7 @@ void TopOverlay::Render() {
       for (int x = 0; x < WW; ++x) px32[(size_t)y * dibW_ + x] = 0x01000000;
   }
 
+  std::vector<RECT> spotLocal;  // drop spots, window coordinates
   {
     Bitmap bmp(WW, WH, dibW_ * 4, PixelFormat32bppPARGB, (BYTE*)bits_);
     Graphics g(&bmp);
@@ -635,6 +680,45 @@ void TopOverlay::Render() {
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
 
+    if (!look_.spots.empty()) {
+      // One pill per phone, side by side; the one under the cursor is outlined.
+      auto& F = FontsFor(s);
+      size_t n = look_.spots.size();
+      float gap = kSpotGap * s;
+      float sw = (W - gap * (n - 1)) / n;
+      float ca = std::clamp((cw_ - look_.w * 0.6f) / (look_.w * 0.4f), 0.f, 1.f) *
+                 std::clamp(look_.h > 30 ? (ch_ - 30) / (look_.h - 30) : 0.f, 0.f, 1.f);
+      StringFormat tf;
+      tf.SetTrimming(StringTrimmingEllipsisCharacter);
+      tf.SetFormatFlags(StringFormatFlagsNoWrap);
+      tf.SetLineAlignment(StringAlignmentCenter);
+      StringFormat cf;
+      cf.SetAlignment(StringAlignmentCenter);
+      cf.SetLineAlignment(StringAlignmentCenter);
+      for (size_t i = 0; i < n; ++i) {
+        float x = i * (sw + gap);
+        bool hot = (int)i == look_.hot;
+        GraphicsPath p;
+        AddRoundRect(p, x + 0.5f, 0.5f, sw - 1.f, H - 1.f, min(H / 2.f, 30 * s));
+        SolidBrush bg(Fade(kBg, 1));
+        g.FillPath(&bg, &p);
+        Pen border(hot ? Fade(kBlue, 1) : Color(40, 255, 255, 255), hot ? 2 * s : 1 * s);
+        g.DrawPath(&border, &p);
+        spotLocal.push_back(RECT{(LONG)x, 0, (LONG)(x + sw), H});
+        if (ca < 0.05f) continue;
+        float pad = 12 * s, d = 32 * s, cy = H / 2.f;
+        SolidBrush ib(Fade(hot ? kBlue : kGrayBtn, ca));
+        g.FillEllipse(&ib, x + pad, cy - d / 2, d, d);
+        wchar_t gs[2] = {kGlyphPhone, 0};
+        SolidBrush wb(Fade(0xFFFFFFFF, ca));
+        g.DrawString(gs, 1, F.icon.get(), RectF(x + pad, cy - d / 2, d, d), &cf, &wb);
+        float tx = x + pad + d + 10 * s, tw = max(10.f, sw - (tx - x) - pad);
+        SolidBrush gray(Fade(0xFFB4B4B4, ca));
+        g.DrawString(look_.spots[i].c_str(), -1, F.title.get(), RectF(tx, cy - 20 * s, tw, 20 * s), &tf, &wb);
+        const wchar_t* sub = hot ? L"Release to send" : L"Drop here";
+        g.DrawString(sub, -1, F.sub.get(), RectF(tx, cy + 1 * s, tw, 18 * s), &tf, &gray);
+      }
+    } else {
     GraphicsPath pill;
     AddRoundRect(pill, 0.5f, 0.5f, W - 1.f, H - 1.f, min(H / 2.f, 30 * s));
     SolidBrush bg(Fade(kBg, 1));
@@ -727,12 +811,16 @@ void TopOverlay::Render() {
         g.DrawString(look_.sub.c_str(), -1, F.sub.get(), RectF(tx, cy + 1 * s, tw, 18 * s), &tf, &gray);
       }
     }
+    }  // single pill
   }
 
   MONITORINFO mi{sizeof mi};
   GetMonitorInfoW(monitor_, &mi);
   POINT dst{mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left - WW) / 2,
             mi.rcMonitor.top + (band ? 0 : (LONG)std::lround(cy_ * s))};
+  spotRects_.clear();
+  for (auto r : spotLocal)
+    spotRects_.push_back(RECT{r.left + px + dst.x, r.top + py + dst.y, r.right + px + dst.x, r.bottom + py + dst.y});
   SIZE sz{WW, WH};
   POINT src{0, 0};
   BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};

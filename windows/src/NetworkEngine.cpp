@@ -14,8 +14,9 @@ namespace {
 // Inside an authenticated, encrypted channel (see Crypto.h), one item per connection:
 //   OFFER "TDRP" ver=1 | type | size u64 | nameLen u16 | senderLen u16 | idLen u16 | name | sender | id
 //   DECISION u8 · STREAM size bytes · ACK u8
-// Types: 1 file, 2 text, 3 the phone's log lines (appended to ours), 4 the phone closes the link.
-constexpr uint8_t kTypeFile = 1, kTypeText = 2, kTypeLog = 3, kTypeBye = 4;
+// Types: 1 file, 2 text, 3 the phone's log lines (appended to ours), 4 the phone closes the link,
+// 5 (PC to phone) another phone is waiting: let the link go. Phones before 0.2 answer 5 with "busy".
+constexpr uint8_t kTypeFile = 1, kTypeText = 2, kTypeLog = 3, kTypeBye = 4, kTypeRelease = 5;
 constexpr uint8_t kAccepted = 1, kDeclined = 2, kBusy = 3;
 constexpr uint8_t kAckOk = 0x00, kAckBad = 0xFF;
 constexpr size_t kChunk = 1 << 20;     // big reads/writes: fewer syscalls, full records
@@ -74,10 +75,11 @@ std::string IpStr(const in_addr& a) {
   return b;
 }
 
-Bytes PairedKey() {
-  std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-  return Cfg().pairKey;
-}
+// Counts a transfer in progress, so the link isn't handed to another phone under it.
+struct BusyLink {
+  BusyLink() { TheWifiDirect().busy++; }
+  ~BusyLink() { TheWifiDirect().busy--; }
+};
 
 }  // namespace
 
@@ -106,11 +108,15 @@ bool NetworkEngine::OpenListener() {
 bool NetworkEngine::Start(HWND notify) {
   notify_ = notify;
   TheOutbox().Load(Cfg().dataDir + L"\\outbox.txt");
+  {
+    std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+    TheOutbox().AssignPhone(Cfg().DefaultPhone());  // items queued by 0.1.x
+  }
   bool ok = !enabled || OpenListener();
   threads_.emplace_back(&NetworkEngine::SenderLoop, this);
   threads_.emplace_back(&NetworkEngine::ServerLoop, this);
   threads_.emplace_back(&NetworkEngine::TickerLoop, this);
-  Log("Started. id=%s, paired=%s", Cfg().deviceId.c_str(), PairedKey().empty() ? "no" : "yes");
+  Log("Started %s. id=%s, phones paired: %zu", WINDROP_VERSION, Cfg().deviceId.c_str(), Phones().size());
   return ok;
 }
 
@@ -139,20 +145,39 @@ void NetworkEngine::SetEnabled(bool on) {
   }
 }
 
-void NetworkEngine::SendFiles(const std::vector<std::wstring>& paths) {
+void NetworkEngine::UsedPhone(const std::string& phoneId) {
+  std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+  if (phoneId.empty() || Cfg().lastPhoneId == phoneId || !Cfg().Find(phoneId)) return;
+  Cfg().lastPhoneId = phoneId;
+  Cfg().Save();
+}
+
+void NetworkEngine::SendFiles(const std::vector<std::wstring>& paths, std::string phoneId) {
+  if (phoneId.empty()) {
+    std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+    phoneId = Cfg().DefaultPhone();
+  }
+  UsedPhone(phoneId);
   std::lock_guard<std::mutex> lk(qmx_);
   for (auto& p : paths) {
     Job j;
+    j.phoneId = phoneId;
     j.path = p;
     queue_.push_back(j);
   }
   qcv_.notify_one();
 }
 
-void NetworkEngine::SendText(const std::string& utf8) {
+void NetworkEngine::SendText(const std::string& utf8, std::string phoneId) {
   if (utf8.empty()) return;
+  if (phoneId.empty()) {
+    std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+    phoneId = Cfg().DefaultPhone();
+  }
+  UsedPhone(phoneId);
   std::lock_guard<std::mutex> lk(qmx_);
   Job j;
+  j.phoneId = phoneId;
   j.isText = true;
   j.text = utf8;
   queue_.push_back(j);
@@ -197,8 +222,21 @@ void NetworkEngine::CancelOutbox(const std::vector<uint64_t>& ids) {
   if (!flushLeft_) flushing_ = false;
 }
 
-void NetworkEngine::FlushOutbox() {
-  auto items = TheOutbox().Snapshot();
+void NetworkEngine::OnLinkUp() {
+  // The link that just came up is almost always the phone the beacon called.
+  std::string phone;
+  {
+    std::lock_guard<std::mutex> lk(tmx_);
+    phone = waking_;
+  }
+  if (!phone.empty()) FlushOutbox(phone);
+}
+
+void NetworkEngine::FlushOutbox(const std::string& phoneId) {
+  auto all = TheOutbox().Snapshot();
+  std::vector<OutboxItem> items;
+  for (auto& it : all)
+    if (it.phoneId == phoneId) items.push_back(it);
   if (items.empty()) return;
   std::lock_guard<std::mutex> lk(qmx_);
   if (flushing_) return;
@@ -206,6 +244,7 @@ void NetworkEngine::FlushOutbox() {
   flushLeft_ = items.size();
   for (auto& it : items) {
     Job j;
+    j.phoneId = it.phoneId;
     j.isText = it.isText;
     j.path = it.path;
     j.text = it.text;
@@ -232,12 +271,18 @@ void NetworkEngine::SenderLoop() {
     bool fromOutbox = job.outboxId != 0;
     if (r == Result::Offline && !fromOutbox) {
       OutboxItem it;
+      it.phoneId = job.phoneId;
       it.isText = job.isText;
       it.path = job.path;
       it.text = job.text;
       auto* e = new UiEvent{NetEv::Offline};
+      e->phone = job.phoneId;
       e->id = TheOutbox().Add(it);
-      if (enabled) TheWifiDirect().SetBeacon(WifiDirectHost::kBeaconPending);  // wake the phone now, not on the next tick
+      if (enabled && TheWifiDirect().PeerIp().empty()) {
+        TheWifiDirect().SetBeacon(WifiDirectHost::kBeaconPending, job.phoneId);  // wake it now, not on the next tick
+        std::lock_guard<std::mutex> lk(tmx_);
+        if (waking_.empty()) { waking_ = job.phoneId; wakingSince_ = GetTickCount64(); }
+      }
       e->count = TheOutbox().Count();
       e->name = name;
       Post(e);
@@ -255,10 +300,12 @@ void NetworkEngine::SenderLoop() {
       if (fromOutbox && r != Result::Failed) TheOutbox().Remove(job.outboxId);
       if (r == Result::Ok) {
         auto* e = new UiEvent{NetEv::SendDone};
+        e->phone = job.phoneId;
         e->name = name;
         Post(e);
       } else if (r == Result::Declined) {
         auto* e = new UiEvent{NetEv::Declined};
+        e->phone = job.phoneId;
         e->name = name;
         Post(e);
       } else {
@@ -309,8 +356,12 @@ SOCKET NetworkEngine::ConnectPeer(std::string* usedIp) {
 
 NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
   if (!enabled) return Result::Offline;
-  Bytes key = PairedKey();
-  if (key.empty()) { Log("send: no phone paired"); return Result::Failed; }
+  Bytes key = KeyFor(job.phoneId);
+  if (key.empty()) { Log("send: that phone isn't paired (any more)"); return Result::Failed; }
+  // One link at a time: if another phone holds it, this waits; the ticker hands the link over
+  // once that phone is idle.
+  std::string linked = TheWifiDirect().LinkedPhone();
+  if (!linked.empty() && linked != job.phoneId) return Result::Offline;
   uint64_t size = 0;
   HANDLE f = INVALID_HANDLE_VALUE;
   std::wstring name = L"text.txt";
@@ -353,11 +404,21 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
     PostIncompatible(peer);
     return Result::Failed;
   }
+  if (hs == SecureChannel::kRefused) {
+    // Another paired phone holds the link (it doesn't know this phone's key): wait our turn.
+    Log("send: the phone on the link isn't %s", W2U(PhoneLabel(job.phoneId)).c_str());
+    return Result::Offline;
+  }
   if (hs != SecureChannel::kOk) {
     Log("send: phone at %s failed the pairing check", ip.c_str());
     return Result::Failed;
   }
-  TheWifiDirect().MarkAuthenticated();
+  TheWifiDirect().MarkAuthenticated(job.phoneId);
+  BusyLink busy;
+  struct Done {
+    std::atomic<ULONGLONG>& t;
+    ~Done() { t = GetTickCount64(); }
+  } done{lastActivity_};
   std::wstring sender;
   {
     std::lock_guard<std::recursive_mutex> lk(CfgMutex());
@@ -450,18 +511,15 @@ void NetworkEngine::HandleIncoming(SOCKET c, const std::string& ip) {
   SecureChannel ch;
   ch.s = c;
   std::string peerId;
-  bool ok = ch.ServerHandshake(
-      [](const std::string& id) {
-        std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-        return id == Cfg().pairedPhoneId ? Cfg().pairKey : Bytes{};
-      },
-      &peerId);
+  bool ok = ch.ServerHandshake([](const std::string& id) { return KeyFor(id); }, &peerId);
   if (!ok) {
     Log("refused a connection from %s: not the paired phone", ip.c_str());
     return;
   }
-  if (ip == TheWifiDirect().PeerIp()) TheWifiDirect().MarkAuthenticated();
-  HandleSession(ch, ip);
+  if (ip == TheWifiDirect().PeerIp()) TheWifiDirect().MarkAuthenticated(peerId);
+  BusyLink busy;
+  HandleSession(ch, ip, peerId);
+  lastActivity_ = GetTickCount64();
 }
 
 // Tells the UI which side needs updating; shown at most once a minute.
@@ -476,7 +534,7 @@ void NetworkEngine::PostIncompatible(const PeerVersion& peer) {
   Post(e);
 }
 
-void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip) {
+void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip, const std::string& phoneId) {
   uint8_t fx[20];
   if (!ch.Recv(fx, sizeof fx) || memcmp(fx, "TDRP", 4) != 0 || fx[4] != 1) return;
   uint8_t type = fx[5];
@@ -501,11 +559,13 @@ void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip) {
   std::wstring wname = SanitizeName(U2W(name));
   {
     std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-    if (!sender.empty() && Cfg().pairedPhoneName != U2W(sender)) {
-      Cfg().pairedPhoneName = U2W(sender);
-      Cfg().Save();
-    }
+    for (auto& p : Cfg().phones)
+      if (p.id == phoneId && !sender.empty() && p.name != U2W(sender)) {
+        p.name = U2W(sender);  // renamed on the phone
+        Cfg().Save();
+      }
   }
+  UsedPhone(phoneId);
   uint8_t d = kAccepted;  // authenticated as the paired phone: no prompt
   if (!ch.Send(&d, 1)) return;
 
@@ -585,10 +645,21 @@ void NetworkEngine::HandlePair(SOCKET c) {
   if (!RecvRaw(c, name.data(), nameLen)) return;
 
   Bytes pairLabel = Str("WDR2 pair");
-  if (!TheWifiDirect().Pairing() || id.empty()) {
-    Log("pair: refused (pairing window closed)");
+  bool full = false;
+  {
+    std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+    full = Cfg().phones.size() >= kMaxPhones && !Cfg().Find(id);
+  }
+  if (!TheWifiDirect().Pairing() || id.empty() || full) {
+    Log("pair: refused (%s)", full ? "already 4 phones paired" : "pairing window closed");
     uint8_t no = kStatusRefused;
     SendRaw(c, &no, 1);
+    if (full) {
+      auto* e = new UiEvent{NetEv::PairDone};
+      e->name = U2W(name);
+      e->count = 0;
+      Post(e);
+    }
     return;
   }
 
@@ -651,15 +722,14 @@ void NetworkEngine::HandlePair(SOCKET c) {
   }
   {
     std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-    Cfg().pairedPhoneId = id;
-    Cfg().pairedPhoneName = wname;
-    Cfg().pairKey = key;
+    Cfg().AddPhone({id, wname, key});
+    Cfg().lastPhoneId = id;
     Cfg().Save();
   }
   uint8_t done = 0;
   SendRaw(c, &done, 1);
   Log("pair: paired with %s", name.c_str());
-  TheWifiDirect().MarkAuthenticated();
+  TheWifiDirect().MarkAuthenticated(id);
   auto* e = new UiEvent{NetEv::PairDone};
   e->name = wname;
   e->count = 1;
@@ -673,14 +743,54 @@ void NetworkEngine::TickerLoop() {
     if (stop_) return;
     ULONGLONG now = GetTickCount64();
     bool probe = false;
-    // Something waiting for the phone (or about to be: a drag is heading for the pill) and no
-    // link yet: ask the phone over Bluetooth to open one.
-    bool paired = !PairedKey().empty();
-    bool wanted = paired && (TheOutbox().Count() > 0 || TheWifiDirect().Prewarming()) && TheWifiDirect().PeerIp().empty();
-    TheWifiDirect().SetBeacon(!enabled ? WifiDirectHost::kBeaconOff
-                              : wanted ? WifiDirectHost::kBeaconPending
-                              : TheWifiDirect().Pairing() ? WifiDirectHost::kBeaconPresence
-                                                          : WifiDirectHost::kBeaconOff);
+    auto& wfd = TheWifiDirect();
+    bool linkUp = !wfd.PeerIp().empty();
+    std::string linked = wfd.LinkedPhone();
+
+    // Phones with something waiting, oldest item first; a drag heading for a phone's spot puts
+    // that phone first.
+    std::vector<std::string> waiting;
+    std::string prewarm = wfd.PrewarmPhone();
+    if (!prewarm.empty() && KeyFor(prewarm).size()) waiting.push_back(prewarm);
+    for (auto& it : TheOutbox().Snapshot())
+      if (std::find(waiting.begin(), waiting.end(), it.phoneId) == waiting.end() && KeyFor(it.phoneId).size())
+        waiting.push_back(it.phoneId);
+
+    // No link: call one phone over Bluetooth. If it doesn't come within 30 s, try the next.
+    if (linkUp || waiting.empty()) {
+      waking_.clear();
+    } else if (waking_.empty() || std::find(waiting.begin(), waiting.end(), waking_) == waiting.end() ||
+               (!prewarm.empty() && waking_ != prewarm)) {
+      waking_ = waiting.front();
+      wakingSince_ = now;
+    } else if (now - wakingSince_ > 30000 && waiting.size() > 1) {
+      auto i = std::find(waiting.begin(), waiting.end(), waking_);
+      waking_ = (i + 1 == waiting.end()) ? waiting.front() : *(i + 1);
+      wakingSince_ = now;
+    }
+    wfd.SetBeacon(!enabled ? WifiDirectHost::kBeaconOff
+                  : !waking_.empty() ? WifiDirectHost::kBeaconPending
+                  : wfd.Pairing() ? WifiDirectHost::kBeaconPresence
+                                  : WifiDirectHost::kBeaconOff,
+                  waking_);
+
+    // A link to a phone with nothing left to do, while another phone waits: hand it over.
+    bool othersWait = std::any_of(waiting.begin(), waiting.end(), [&](const std::string& p) { return p != linked; });
+    bool linkedWaits = false;
+    for (auto& it : TheOutbox().Snapshot()) linkedWaits = linkedWaits || it.phoneId == linked;
+    bool idle = wfd.busy == 0 && now > lastActivity_ + 2000 && prewarm != linked;
+    {
+      std::lock_guard<std::mutex> qlk(qmx_);
+      idle = idle && queue_.empty() && !flushing_;
+    }
+    if (enabled && linkUp && !linked.empty() && othersWait && !linkedWaits && idle && !handingOff_.exchange(true)) {
+      Log("link: %s is done, handing the link to the next phone", W2U(PhoneLabel(linked)).c_str());
+      std::thread([this, linked] {
+        HandOff(linked);
+        handingOff_ = false;
+      }).detach();
+    }
+
     if (TheOutbox().Count() == 0) {
       backoffSec_ = 15;
       nextProbe_ = now + 15000;
@@ -690,9 +800,51 @@ void NetworkEngine::TickerLoop() {
       backoffSec_ = std::min(backoffSec_ * 2, 600);
     }
     lk.unlock();
-    if (probe && enabled) FlushOutbox();
+    // The phone on the link has things waiting: send them now, not at the next probe.
+    if (enabled && !linked.empty() && (probe || linkedWaits)) FlushOutbox(linked);
     lk.lock();
   }
+}
+
+// Asks the phone on the link to let it go. Just closing the link isn't enough: a phone that still
+// wanted it reconnects by itself. Phones that don't know the request get their link closed.
+void NetworkEngine::HandOff(const std::string& phoneId) {
+  int answer = -1;
+  std::string ip;
+  SOCKET s = ConnectPeer(&ip);
+  for (int i = 0; s == INVALID_SOCKET && i < 4 && !TheWifiDirect().PeerIp().empty(); ++i) {
+    Sleep(400);  // the phone's Wi-Fi may be dozing between transfers
+    s = ConnectPeer(&ip);
+  }
+  if (s == INVALID_SOCKET) Log("link: couldn't reach the phone to ask");
+  if (s != INVALID_SOCKET) {
+    SetTimeouts(s, 5000);
+    SecureChannel ch;
+    ch.s = s;
+    PeerVersion peer;
+    std::wstring me;
+    {
+      std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+      me = Cfg().deviceName;
+    }
+    auto hs = ch.ClientHandshake(KeyFor(phoneId), Cfg().deviceId, &peer);
+    if (hs == SecureChannel::kOk) {
+      std::string hdr = BuildOffer(kTypeRelease, 0, "", W2U(me), Cfg().deviceId);
+      uint8_t d = 0;
+      if (ch.Send(hdr.data(), hdr.size()) && ch.Recv(&d, 1)) answer = d;
+      else Log("link: no answer from the phone");
+    } else {
+      Log("link: handshake with the phone failed (%d)", (int)hs);
+    }
+    closesocket(s);
+  }
+  if (answer == kDeclined) {  // it's about to send something: ask again in a few seconds
+    Log("link: %s is still busy, keeping the link", W2U(PhoneLabel(phoneId)).c_str());
+    lastActivity_ = GetTickCount64() + 3000;
+    return;
+  }
+  Log(answer == kAccepted ? "link: the phone let the link go" : "link: closing it (answer %d)", answer);
+  TheWifiDirect().Disconnect();
 }
 
 void NetworkEngine::ReceivePhoneLog(SecureChannel& ch, uint64_t size) {

@@ -21,6 +21,7 @@ class TopOverlay {
 
   // Called by DropTarget.
   void DragEntered();
+  void DragMoved(POINT screenPt);
   void DragLeft();
   void Dropped(const std::vector<std::wstring>& files, const std::wstring& text);
 
@@ -41,6 +42,8 @@ class TopOverlay {
     bool highlight = false;
     bool clickable = false;
     std::vector<Btn> buttons;
+    std::vector<std::wstring> spots;  // 2+ phones paired: one drop spot per phone instead of the pill
+    int hot = -1;                     // the spot under the cursor
   };
   struct Message {
     bool active = false;
@@ -84,6 +87,11 @@ class TopOverlay {
   Look look_;
 
   int drag_ = 0;  // 0 none, 1 hint, 2 hovering the pill
+  std::vector<std::string> spotPhones_;  // phone ids of the drop spots, left to right
+  std::vector<RECT> spotRects_;          // their last drawn bounds, screen coordinates
+  int hotSpot_ = -1;
+  int SpotAt(POINT screenPt) const;
+  float BandW() const;
   bool oleInside_ = false;
   bool wasDown_ = false;
   POINT pressPt_{};

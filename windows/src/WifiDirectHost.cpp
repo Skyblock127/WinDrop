@@ -61,7 +61,7 @@ winrt::Windows::Storage::Streams::IBuffer Buf(const std::string& s) {
 
 bool HavePairedPhone() {
   std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-  return !Cfg().pairKey.empty();
+  return !Cfg().phones.empty();
 }
 
 // The phone asked to join: pair without any system prompt (push-button), then open the device to
@@ -72,6 +72,13 @@ void Accept(WiFiDirectConnectionRequest const& req) {
   struct Done { ~Done() { gAccepting--; } } done;
   auto info = req.DeviceInformation();
   Log("wfd: connection request from %s (paired=%d)", W2U(std::wstring(info.Name())).c_str(), (int)info.Pairing().IsPaired());
+  // One phone at a time: while another is mid-transfer, say no; it retries in a few seconds. An
+  // idle link gives way (its phone reconnects when it next needs us).
+  if (!TheWifiDirect().PeerIp().empty() && TheWifiDirect().busy > 0) {
+    Log("wfd: refused %s: another phone is transferring", W2U(std::wstring(info.Name())).c_str());
+    try { req.Close(); } catch (...) {}
+    return;
+  }
   if (!HavePairedPhone() && !TheWifiDirect().Pairing()) {
     Log("wfd: refused: no phone paired and the pairing window is closed");
     // Close it rather than leave it hanging: an unanswered request makes Windows sit on this phone's
@@ -156,7 +163,17 @@ void WifiDirectHost::LinkUp() {
   }).detach();
 }
 
-void WifiDirectHost::MarkAuthenticated() { authedSeq_ = linkSeq_.load(); }
+void WifiDirectHost::MarkAuthenticated(const std::string& phoneId) {
+  std::lock_guard<std::mutex> lk(mx_);
+  authedSeq_ = linkSeq_.load();
+  authedPhone_ = phoneId;
+}
+
+std::string WifiDirectHost::LinkedPhone() {
+  if (PeerIp().empty()) return "";
+  std::lock_guard<std::mutex> lk(mx_);
+  return authedSeq_ == linkSeq_ ? authedPhone_ : "";
+}
 
 void WifiDirectHost::Disconnect() {
   // Closing the device object ends the group; do it off the network thread.
@@ -182,23 +199,20 @@ std::string WfdName() {
 //            paired phone recognises it and it can't be used to follow this PC around.
 //   pairing: "WP" + 0x00 + this PC's Wi-Fi Direct name, only while "Pair phone…" is open,
 //            so a phone that is pairing can find us.
-void WifiDirectHost::SetBeacon(Beacon mode) {
+void WifiDirectHost::SetBeacon(Beacon mode, const std::string& phoneId) {
   std::lock_guard<std::mutex> lk(mx_);
   int64_t window = BeaconWindow();
-  if (mode == beacon_ && (mode != kBeaconPending || window == beaconWindow_)) return;
-  bool entering = mode != beacon_;
+  if (mode == beacon_ && (mode != kBeaconPending || (window == beaconWindow_ && phoneId == beaconPhone_))) return;
+  bool entering = mode != beacon_ || phoneId != beaconPhone_;
   beacon_ = mode;
   beaconWindow_ = window;
+  beaconPhone_ = phoneId;
   try {
     if (gBeacon) { gBeacon.Stop(); gBeacon = nullptr; }
     if (mode == kBeaconOff) { Log("ble: beacon off"); return; }
     std::string data;
     if (mode == kBeaconPending) {
-      td::Bytes key;
-      {
-        std::lock_guard<std::recursive_mutex> ck(CfgMutex());
-        key = Cfg().pairKey;
-      }
+      td::Bytes key = KeyFor(phoneId);
       if (key.empty()) { beacon_ = kBeaconOff; return; }
       td::Bytes tag = BeaconTag(key, window);
       data = "WD" + std::string(tag.begin(), tag.end()) + std::string(1, char(1));
@@ -217,7 +231,8 @@ void WifiDirectHost::SetBeacon(Beacon mode) {
     adv.ManufacturerData().Append(md);
     gBeacon = BluetoothLEAdvertisementPublisher(adv);
     gBeacon.Start();
-    if (entering) Log("ble: beacon %s", mode == kBeaconPending ? "on (phone, connect)" : "on (pairing)");
+    if (entering)
+      Log("ble: beacon %s", mode == kBeaconPending ? ("on (wake " + W2U(PhoneLabel(phoneId)) + ")").c_str() : "on (pairing)");
   } catch (winrt::hresult_error const& ex) {
     Log("ble: beacon failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
     beacon_ = kBeaconOff;

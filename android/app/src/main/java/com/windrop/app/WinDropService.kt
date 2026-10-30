@@ -590,6 +590,18 @@ class WinDropService : Service() {
         val inp = DataInputStream(ch.input)
         val out = ch.output
         val offer = Proto.readOffer(inp) ?: return
+        if (offer.type == Proto.TYPE_RELEASE) {
+            // The PC serves one phone at a time and another one is waiting. Let go unless we're
+            // about to send something (this request itself counts as one receive).
+            val free = !pairing && queued.get() == 0 && receiving.get() <= 1 && pending.isEmpty()
+            out.write(if (free) Proto.ACCEPTED else Proto.DECLINED)
+            out.flush()
+            if (free) {
+                Logs.i("PC needs the link for another phone, letting go")
+                main.post { p2p.release(); ble.reset(); updateServiceNotification() }
+            }
+            return
+        }
         if (offer.type != Proto.TYPE_FILE && offer.type != Proto.TYPE_TEXT ||
             offer.type == Proto.TYPE_TEXT && offer.size > Proto.MAX_TEXT
         ) { out.write(Proto.BUSY); out.flush(); return }

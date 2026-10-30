@@ -42,7 +42,8 @@ enum : UINT {
   IDM_EXIT,
   IDM_QUEUE_CLEAR,
   IDM_UPDATE,
-  IDM_QUEUE_ITEM = 1000,  // + index into gMenuQueue
+  IDM_QUEUE_ITEM = 1000,   // + index into gMenuQueue
+  IDM_PHONE_REMOVE = 1100, // + index into gMenuPhones  // + index into gMenuQueue
 };
 
 constexpr UINT WM_APP_UPDATE = WM_APP + 40;         // wParam: 1 = asked by the user; lParam: UpdateInfo* (null = check failed)
@@ -57,7 +58,15 @@ UINT gTaskbarCreated;
 HICON gIconOn, gIconOff;
 NetworkEngine gNet;
 TopOverlay gOverlay;
-std::wstring gPeerLine = L"Phone: not paired yet";
+
+// "Phone: A" / "Phones: A, B" for the tray tooltip and menu.
+std::wstring PhonesLine() {
+  auto phones = Phones();
+  if (phones.empty()) return L"No phone paired yet";
+  std::wstring s = phones.size() == 1 ? L"Phone: " : L"Phones: ";
+  for (size_t i = 0; i < phones.size(); ++i) s += (i ? L", " : L"") + (phones[i].name.empty() ? L"phone" : phones[i].name);
+  return s;
+}
 
 HICON LoadTrayIcon(int id) {
   return (HICON)LoadImageW(gInst, MAKEINTRESOURCEW(id), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
@@ -157,6 +166,7 @@ void RefreshStartupPath() {
 
 // ---- queued (not yet sent) items, shown in the tray menu ----
 std::vector<OutboxItem> gMenuQueue;  // what the open menu listed, by index
+std::vector<PairedPhone> gMenuPhones;
 
 std::wstring QueueLabel(const OutboxItem& it) {
   std::wstring s;
@@ -167,6 +177,7 @@ std::wstring QueueLabel(const OutboxItem& it) {
   } else {
     s = FileNameOf(it.path);
   }
+  if (Phones().size() > 1) s = PhoneLabel(it.phoneId) + L" ← " + s;
   if (s.size() > 48) s = s.substr(0, 47) + L"…";
   std::wstring out;  // a lone & would underline the next letter
   for (auto c : s) {
@@ -252,7 +263,7 @@ void SendClipboard() {
     Log("ui: send clipboard (%zu files)", files.size());
     if (!files.empty()) gNet.SendFiles(files);
     else gNet.SendText(W2U(text));
-    gOverlay.Notify(L"Sending clipboard to phone\u2026", files.empty() ? L"Text" : std::to_wstring(files.size()) + L" file(s)");
+    gOverlay.Notify(L"Sending clipboard to " + PhoneLabel(std::string()) + L"…", files.empty() ? L"Text" : std::to_wstring(files.size()) + L" file(s)");
   } else {
     gOverlay.Notify(L"Clipboard is empty", L"Copy some text or files first", true);
   }
@@ -262,7 +273,7 @@ void SendClipboard() {
 // ---- tray ----
 void UpdateTray() {
   bool on = Cfg().enabled;
-  std::wstring tip = on ? L"WinDrop \u2014 " + gPeerLine : L"WinDrop \u2014 off";
+  std::wstring tip = on ? L"WinDrop — " + PhonesLine() : L"WinDrop — off";
   wcsncpy_s(gNid.szTip, tip.c_str(), _TRUNCATE);
   gNid.hIcon = on ? gIconOn : gIconOff;
   gNid.uFlags = NIF_TIP | NIF_ICON | NIF_SHOWTIP;  // v4 icons show no tooltip without NIF_SHOWTIP
@@ -367,7 +378,7 @@ void OnUpdateChecked(bool manual, UpdateInfo* found) {
 void ShowMenu() {
   bool on = Cfg().enabled;
   HMENU m = CreatePopupMenu();
-  std::wstring status = on ? gPeerLine + L"  \u00b7  link: " + TheWifiDirect().Status() : L"WinDrop is off";
+  std::wstring status = on ? PhonesLine() + L"  ·  link: " + TheWifiDirect().Status() : L"WinDrop is off";
   AppendMenuW(m, MF_STRING | MF_GRAYED, IDM_STATUS, status.c_str());
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(m, MF_STRING | (on ? MF_CHECKED : 0), IDM_ON, L"On");
@@ -377,7 +388,17 @@ void ShowMenu() {
   HMENU q = QueueMenu(&queued);
   std::wstring queueLabel = queued ? L"Waiting to send (" + std::to_wstring(queued) + L")" : L"Waiting to send";
   AppendMenuW(m, MF_POPUP, (UINT_PTR)q, queueLabel.c_str());  // the menu owns q now
-  AppendMenuW(m, MF_STRING, IDM_PAIR, L"Pair phone\u2026");
+  gMenuPhones = Phones();
+  if (gMenuPhones.empty()) {
+    AppendMenuW(m, MF_STRING, IDM_PAIR, L"Pair phone…");
+  } else {
+    HMENU ph = CreatePopupMenu();
+    for (size_t i = 0; i < gMenuPhones.size(); ++i)
+      AppendMenuW(ph, MF_STRING, IDM_PHONE_REMOVE + UINT(i), (L"Remove " + gMenuPhones[i].name + L"…").c_str());
+    AppendMenuW(ph, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(ph, MF_STRING | (gMenuPhones.size() >= kMaxPhones ? MF_GRAYED : 0), IDM_PAIR, L"Pair another phone…");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)ph, L"Phones");
+  }
   AppendMenuW(m, MF_STRING, IDM_OPENDIR, L"Open received folder");
   AppendMenuW(m, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), IDM_STARTUP, L"Start with Windows");
   std::wstring upd = gUpdate.version.empty() ? L"Check for updates (v" + U2W(WINDROP_VERSION) + L")"
@@ -439,6 +460,25 @@ void OnCommand(UINT id) {
       break;
     }
     default:
+      if (id >= IDM_PHONE_REMOVE && id - IDM_PHONE_REMOVE < gMenuPhones.size()) {
+        auto p = gMenuPhones[id - IDM_PHONE_REMOVE];
+        std::wstring q = L"Remove “" + p.name + L"”?\n\nIt won't be able to send to or receive from this PC until you pair it again. Anything waiting for it is dropped.";
+        if (MessageBoxW(gMain, q.c_str(), L"WinDrop", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) != IDYES) break;
+        std::vector<uint64_t> drop;
+        for (auto& it : TheOutbox().Snapshot())
+          if (it.phoneId == p.id) drop.push_back(it.id);
+        gNet.CancelOutbox(drop);
+        {
+          std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+          Cfg().RemovePhone(p.id);
+          Cfg().Save();
+        }
+        if (TheWifiDirect().LinkedPhone() == p.id) TheWifiDirect().Disconnect();
+        Log("ui: removed phone %s", W2U(p.name).c_str());
+        UpdateTray();
+        gOverlay.Notify(L"Removed " + p.name, L"Pair it again from the tray to use it");
+        break;
+      }
       if (id >= IDM_QUEUE_ITEM && id - IDM_QUEUE_ITEM < gMenuQueue.size()) {
         auto& it = gMenuQueue[id - IDM_QUEUE_ITEM];
         gNet.CancelOutbox({it.id});
@@ -492,9 +532,9 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
       }
       if (e->type == NetEv::PairDone) {
-        gPeerLine = L"Phone: " + e->name;
         UpdateTray();
-        gOverlay.Notify(L"Paired with " + e->name, L"Transfers are now encrypted");
+        if (e->count) gOverlay.Notify(L"Paired with " + e->name, L"Transfers are now encrypted");
+        else gOverlay.Notify(L"Can't pair " + e->name, L"4 phones are paired already: tray → Phones to remove one", true);
         return 0;
       }
       if (e->type == NetEv::Incompatible) {
@@ -507,10 +547,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
       }
-      if (e->type == NetEv::PeerSeen) {
-        gPeerLine = L"Phone: " + e->name;
-        UpdateTray();
-      }
+      if (e->type == NetEv::PeerSeen) UpdateTray();
       gOverlay.OnNetEvent(*e);
       return 0;
     }
@@ -592,7 +629,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   Cfg().Load();
   {
     std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-    if (!Cfg().pairedPhoneName.empty()) gPeerLine = L"Phone: " + Cfg().pairedPhoneName;
   }
   gIconOn = LoadTrayIcon(kIconOn);
   gIconOff = LoadTrayIcon(kIconOff);
@@ -607,7 +643,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   gTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
   gOverlay.Create(inst, &gNet);
-  TheWifiDirect().onLinkUp = [] { gNet.FlushOutbox(); };
+  TheWifiDirect().onLinkUp = [] { gNet.OnLinkUp(); };
   if (!gNet.Start(gMain)) gOverlay.Notify(L"WinDrop can't listen on port 53318", L"Is another copy running?", true);
   AddTray();
   EnsureShortcuts();

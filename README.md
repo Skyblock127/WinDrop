@@ -25,6 +25,7 @@ AirDrop-style transfers between an Android phone and a Windows PC: files, text, 
 
 - **Phone → PC:** Share → **WinDrop**, or **Send clipboard to PC** in the app or notification.
 - **PC → phone:** drag onto the pill at the top-center of the screen, Explorer → *Send to → Phone (WinDrop)*, or `Ctrl+Alt+P` for the clipboard.
+- **Several phones:** pair up to 4 (tray → **Phones → Pair another phone…**). Dragging then shows one drop spot per phone; `Ctrl+Alt+P` and *Send to* go to the phone you used last.
 - Files land in `Downloads\WinDrop` on both sides; text and links go to the clipboard.
 - Anything sent while the other side is out of reach waits and goes out by itself (PC: tray → **Waiting to send**; phone: **Not sent yet** in the app).
 

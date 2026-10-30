@@ -33,6 +33,7 @@ enum class NetEv {
 struct UiEvent {
   NetEv type;
   uint64_t id = 0;
+  std::string phone;  // phone id, for sends
   std::wstring name;
   std::wstring path;
   std::string text;
@@ -47,11 +48,13 @@ class NetworkEngine {
   // Off: the listening socket is closed (nothing on the network answers) and nothing is sent.
   void SetEnabled(bool on);
 
-  void SendFiles(const std::vector<std::wstring>& paths);
-  void SendText(const std::string& utf8);
+  // phoneId empty: the default phone (last used).
+  void SendFiles(const std::vector<std::wstring>& paths, std::string phoneId = "");
+  void SendText(const std::string& utf8, std::string phoneId = "");
   void Decide(uint64_t id, bool accept);
   void CancelOutbox(const std::vector<uint64_t>& ids);
-  void FlushOutbox();
+  void FlushOutbox(const std::string& phoneId);  // what's waiting for the phone now on the link
+  void OnLinkUp();
 
   std::atomic<bool> enabled{true};
 
@@ -61,6 +64,7 @@ class NetworkEngine {
 
  private:
   struct Job {
+    std::string phoneId;
     bool isText = false;
     std::wstring path;
     std::string text;
@@ -75,7 +79,9 @@ class NetworkEngine {
   bool OpenListener();
   Result SendOne(const Job& job);
   void HandleIncoming(SOCKET c, const std::string& ip);
-  void HandleSession(SecureChannel& ch, const std::string& ip);
+  void HandleSession(SecureChannel& ch, const std::string& ip, const std::string& phoneId);
+  void UsedPhone(const std::string& phoneId);  // remember it as the default target
+  void HandOff(const std::string& phoneId);    // ask the phone on the link to let it go
   void HandlePair(SOCKET c);
   void PostIncompatible(const PeerVersion& peer);
   void ReceivePhoneLog(SecureChannel& ch, uint64_t size);
@@ -104,6 +110,10 @@ class NetworkEngine {
   std::condition_variable tcv_;
   int backoffSec_ = 15;
   ULONGLONG nextProbe_ = 0;
+  std::string waking_;         // the phone the beacon is calling (one link at a time)
+  ULONGLONG wakingSince_ = 0;
+  std::atomic<ULONGLONG> lastActivity_{0};  // end of the last transfer
+  std::atomic<bool> handingOff_{false};
 };
 
 }  // namespace td

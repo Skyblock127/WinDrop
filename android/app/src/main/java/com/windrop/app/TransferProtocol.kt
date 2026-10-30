@@ -30,6 +30,7 @@ object Proto {
     const val TYPE_TEXT = 2
     const val TYPE_LOG = 3  // phone log lines for the PC's windrop.log
     const val TYPE_BYE = 4  // phone is closing the link: PC drops its side at once
+    const val TYPE_RELEASE = 5  // PC: another phone is waiting for the link, let it go
     const val ACCEPTED = 1
     const val DECLINED = 2
     const val BUSY = 3
