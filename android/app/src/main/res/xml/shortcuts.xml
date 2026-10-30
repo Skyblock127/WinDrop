@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Lets the "PC" direct-share target appear in the first row of the share sheet. -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <share-target android:targetClass="com.windrop.app.ShareReceiverActivity">
+        <data android:mimeType="*/*" />
+        <category android:name="com.windrop.app.category.SEND_TO_PC" />
+    </share-target>
+</shortcuts>

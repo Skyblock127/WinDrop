@@ -1,0 +1,23 @@
+# Build output
+windows/build/
+windows/build-*/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/.kotlin/
+dist/
+
+# Signing keys never go in the repo (see README: Releases)
+*.jks
+*.keystore
+keystore.properties
+
+# Editors / OS
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
+__pycache__/

@@ -1,0 +1,340 @@
+#include "WifiDirectHost.h"
+
+#include "common.h"
+#include "Crypto.h"
+#include "Settings.h"
+
+#include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Devices.WiFiDirect.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Networking.h>
+#include <winrt/Windows.Storage.Streams.h>
+
+namespace td {
+
+using namespace winrt::Windows::Devices::Enumeration;
+using namespace winrt::Windows::Devices::WiFiDirect;
+using winrt::Windows::Storage::Streams::DataWriter;
+
+namespace {
+
+using namespace winrt::Windows::Devices::Bluetooth::Advertisement;
+
+constexpr uint16_t kBleCompanyId = 0xFFFF;  // "no company" id, reserved for testing / internal use
+
+std::atomic<int> gAccepting{0};
+std::mutex gPeerMx;
+BluetoothLEAdvertisementPublisher gBeacon{nullptr};
+WiFiDirectDevice gPeer{nullptr};  // the link lives as long as this object does
+std::string gPeerIp;
+
+// Drops a half-made pairing so the next attempt starts clean. A good pairing is kept: re-pairing
+// on every link cost ~4.5 s, and the phone asks for temporary groups, so no invitations follow.
+void Unpair(winrt::hstring id) {
+  if (id.empty()) return;
+  std::thread([id] {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    try {
+      auto info = DeviceInformation::CreateFromIdAsync(id).get();
+      if (info.Pairing().IsPaired()) Log("wfd: unpair %d", (int)info.Pairing().UnpairAsync().get().Status());
+    } catch (winrt::hresult_error const& ex) {
+      // Temporary groups leave no device record behind: nothing to unpair.
+      if (ex.code() != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) Log("wfd: unpair failed 0x%08x", (unsigned)ex.code());
+    }
+  }).detach();
+}
+
+void DropPeer() {
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  if (gPeer) try { gPeer.Close(); } catch (...) {}
+  gPeer = nullptr;
+  gPeerIp.clear();
+}
+
+winrt::Windows::Storage::Streams::IBuffer Buf(const std::string& s) {
+  DataWriter w;
+  for (unsigned char c : s) w.WriteByte(c);
+  return w.DetachBuffer();
+}
+
+bool HavePairedPhone() {
+  std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+  return !Cfg().pairKey.empty();
+}
+
+// The phone asked to join: pair without any system prompt (push-button), then open the device to
+// bring the link up. Windows can't tell who is asking, so the link alone grants nothing: a link
+// that doesn't pass WinDrop's key check within a few seconds is dropped (see LinkUp).
+void Accept(WiFiDirectConnectionRequest const& req) {
+  gAccepting++;
+  struct Done { ~Done() { gAccepting--; } } done;
+  auto info = req.DeviceInformation();
+  Log("wfd: connection request from %s (paired=%d)", W2U(std::wstring(info.Name())).c_str(), (int)info.Pairing().IsPaired());
+  if (!HavePairedPhone() && !TheWifiDirect().Pairing()) {
+    Log("wfd: refused: no phone paired and the pairing window is closed");
+    // Close it rather than leave it hanging: an unanswered request makes Windows sit on this phone's
+    // next requests for about 2 minutes, which would stall the pairing the user starts next.
+    try { req.Close(); } catch (...) {}
+    return;
+  }
+  try {
+    if (!info.Pairing().IsPaired()) {
+      auto custom = info.Pairing().Custom();
+      auto token = custom.PairingRequested([](auto const&, DevicePairingRequestedEventArgs const& a) { a.Accept(); });
+      WiFiDirectConnectionParameters params;
+      params.GroupOwnerIntent(15);  // PC stays group owner so the phone keeps its own Wi-Fi
+      params.PreferenceOrderedConfigurationMethods().Append(WiFiDirectConfigurationMethod::PushButton);
+      auto op = custom.PairAsync(DevicePairingKinds::ConfirmOnly, DevicePairingProtectionLevel::Default, params);
+      // A radio hiccup on the phone can leave this hanging; don't let it block the next attempt.
+      if (op.wait_for(std::chrono::seconds(25)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+        op.Cancel();
+        custom.PairingRequested(token);
+        Log("wfd: pairing timed out");
+        Unpair(info.Id());
+        return;
+      }
+      auto r = op.GetResults();
+      custom.PairingRequested(token);
+      Log("wfd: pairing result %d", (int)r.Status());
+      if (r.Status() != DevicePairingResultStatus::Paired && r.Status() != DevicePairingResultStatus::AlreadyPaired) {
+        Unpair(info.Id());  // half-made pairing would block the next attempt
+        return;
+      }
+    }
+    auto open = WiFiDirectDevice::FromIdAsync(info.Id());
+    if (open.wait_for(std::chrono::seconds(20)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+      open.Cancel();
+      Log("wfd: opening the link timed out");
+      return;
+    }
+    auto dev = open.GetResults();
+    if (!dev) { Log("wfd: FromIdAsync returned null"); return; }
+    std::string ip;
+    for (auto const& pair : dev.GetConnectionEndpointPairs()) {
+      ip = W2U(std::wstring(pair.RemoteHostName().CanonicalName()));
+      Log("wfd: link up, phone %s, pc %s", ip.c_str(), W2U(std::wstring(pair.LocalHostName().CanonicalName())).c_str());
+      break;
+    }
+    dev.ConnectionStatusChanged([](WiFiDirectDevice const& d, auto const&) {
+      if (d.ConnectionStatus() == WiFiDirectConnectionStatus::Disconnected) {
+        Log("wfd: link down");
+        DropPeer();
+      }
+    });
+    {
+      std::lock_guard<std::mutex> lk(gPeerMx);
+      if (gPeer) try { gPeer.Close(); } catch (...) {}
+      gPeer = dev;
+      gPeerIp = ip;
+    }
+    TheWifiDirect().LinkUp();
+    // Push queued items now instead of waiting for the phone to say something over the new link.
+    if (auto cb = TheWifiDirect().onLinkUp) cb();
+  } catch (winrt::hresult_error const& ex) {
+    Log("wfd: accept failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
+  }
+}
+
+}  // namespace
+
+WifiDirectHost& TheWifiDirect() {
+  static WifiDirectHost h;
+  return h;
+}
+
+
+void WifiDirectHost::LinkUp() {
+  uint64_t seq = ++linkSeq_;
+  std::thread([this, seq] {
+    Sleep(kAuthGraceMs);
+    if (linkSeq_ == seq && authedSeq_ != seq && !PeerIp().empty()) {
+      Log("wfd: link never proved it's the paired phone, dropping it");
+      DropPeer();
+    }
+  }).detach();
+}
+
+void WifiDirectHost::MarkAuthenticated() { authedSeq_ = linkSeq_.load(); }
+
+void WifiDirectHost::Disconnect() {
+  // Closing the device object ends the group; do it off the network thread.
+  std::thread([] { DropPeer(); }).detach();
+}
+
+std::string WifiDirectHost::PeerIp() {
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  return gPeerIp;
+}
+
+// The name Windows uses in Wi-Fi Direct discovery (NetBIOS computer name), cut to what fits in a
+// legacy 31-byte advert after flags, the company id and our 7-byte header.
+std::string WfdName() {
+  wchar_t n[MAX_COMPUTERNAME_LENGTH + 1];
+  DWORD len = ARRAYSIZE(n);
+  std::string s = GetComputerNameW(n, &len) ? W2U(n) : "";
+  return s.substr(0, 17);
+}
+
+// Beacon payloads (manufacturer data, company 0xFFFF):
+//   pending: "WD" + 6-byte tag + 0x01. The tag is HMAC(pairing key, 10-minute window), so only the
+//            paired phone recognises it and it can't be used to follow this PC around.
+//   pairing: "WP" + 0x00 + this PC's Wi-Fi Direct name, only while "Pair phone…" is open,
+//            so a phone that is pairing can find us.
+void WifiDirectHost::SetBeacon(Beacon mode) {
+  std::lock_guard<std::mutex> lk(mx_);
+  int64_t window = BeaconWindow();
+  if (mode == beacon_ && (mode != kBeaconPending || window == beaconWindow_)) return;
+  bool entering = mode != beacon_;
+  beacon_ = mode;
+  beaconWindow_ = window;
+  try {
+    if (gBeacon) { gBeacon.Stop(); gBeacon = nullptr; }
+    if (mode == kBeaconOff) { Log("ble: beacon off"); return; }
+    std::string data;
+    if (mode == kBeaconPending) {
+      td::Bytes key;
+      {
+        std::lock_guard<std::recursive_mutex> ck(CfgMutex());
+        key = Cfg().pairKey;
+      }
+      if (key.empty()) { beacon_ = kBeaconOff; return; }
+      td::Bytes tag = BeaconTag(key, window);
+      data = "WD" + std::string(tag.begin(), tag.end()) + std::string(1, char(1));
+      if (entering) {
+        // The phone is about to search for us: make sure Windows is actively answering probes.
+        refresh_ = true;
+        cv_.notify_all();
+      }
+    } else {
+      data = "WP" + std::string(1, char(0)) + WfdName();
+    }
+    BluetoothLEAdvertisement adv;
+    BluetoothLEManufacturerData md;
+    md.CompanyId(kBleCompanyId);
+    md.Data(Buf(data));
+    adv.ManufacturerData().Append(md);
+    gBeacon = BluetoothLEAdvertisementPublisher(adv);
+    gBeacon.Start();
+    if (entering) Log("ble: beacon %s", mode == kBeaconPending ? "on (phone, connect)" : "on (pairing)");
+  } catch (winrt::hresult_error const& ex) {
+    Log("ble: beacon failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
+    beacon_ = kBeaconOff;
+  }
+}
+
+void WifiDirectHost::Start() {
+  Stop();
+  stop_ = false;
+  thread_ = std::thread(&WifiDirectHost::Loop, this);
+}
+
+void WifiDirectHost::Stop() {
+  {
+    std::lock_guard<std::mutex> lk(mx_);
+    stop_ = true;
+  }
+  cv_.notify_all();
+  if (thread_.joinable()) thread_.join();
+}
+
+std::wstring WifiDirectHost::Status() {
+  std::lock_guard<std::mutex> lk(mx_);
+  std::string ip = PeerIp();
+  return ip.empty() ? status_ : L"phone connected (" + U2W(ip) + L")";
+}
+
+void WifiDirectHost::Loop() {
+  winrt::init_apartment(winrt::apartment_type::multi_threaded);
+  int backoff = 2;
+  for (;;) {
+    std::atomic<bool> aborted{false};
+    WiFiDirectAdvertisementPublisher pub{nullptr};
+    WiFiDirectConnectionListener listener{nullptr};
+    try {
+      pub = WiFiDirectAdvertisementPublisher();
+      auto adv = pub.Advertisement();
+      // Not an autonomous GO: the phone's connect then runs normal GO negotiation, which is what
+      // raises ConnectionRequested below (invitations to a standing group are ignored by Windows).
+      adv.IsAutonomousGroupOwnerEnabled(false);
+      adv.ListenStateDiscoverability(WiFiDirectAdvertisementListenStateDiscoverability::Intensive);
+
+      listener = WiFiDirectConnectionListener();
+      listener.ConnectionRequested([](auto const&, WiFiDirectConnectionRequestedEventArgs const& e) {
+        WiFiDirectConnectionRequest req = e.GetConnectionRequest();
+        std::thread([req] {
+          winrt::init_apartment(winrt::apartment_type::multi_threaded);
+          Accept(req);
+        }).detach();
+      });
+
+      pub.StatusChanged([this, &aborted](auto const&, WiFiDirectAdvertisementPublisherStatusChangedEventArgs const& e) {
+        auto st = e.Status();
+        Log("wfd: status %d error %d", (int)st, (int)e.Error());
+        if (st == WiFiDirectAdvertisementPublisherStatus::Started) {
+          running_ = true;
+          std::lock_guard<std::mutex> lk(mx_);
+          status_ = L"waiting for phone";
+        } else if (st == WiFiDirectAdvertisementPublisherStatus::Aborted ||
+                   st == WiFiDirectAdvertisementPublisherStatus::Stopped) {
+          running_ = false;
+          aborted = true;
+          {
+            std::lock_guard<std::mutex> lk(mx_);
+            status_ = e.Error() == WiFiDirectError::RadioNotAvailable ? L"Wi-Fi is off" : L"restarting";
+          }
+          cv_.notify_all();
+        }
+      });
+      pub.Start();
+      Log("wfd: publishing");
+    } catch (winrt::hresult_error const& ex) {
+      Log("wfd: start failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
+      std::lock_guard<std::mutex> lk(mx_);
+      status_ = L"not supported here";
+      aborted = true;
+    }
+
+    ULONGLONG began = GetTickCount64();
+    bool quit = false, refresh = false;
+    {
+      std::unique_lock<std::mutex> lk(mx_);
+      // Windows quietly stops answering P2P probes a few minutes after Start(); while no phone is
+      // linked, re-publish periodically so the phone can always find us.
+      for (;;) {
+        if (cv_.wait_for(lk, std::chrono::seconds(90), [&] { return stop_ || aborted.load() || refresh_; })) {
+          if (stop_ || aborted) break;
+          refresh_ = false;
+          if (PeerIp().empty() && gAccepting == 0) { refresh = true; break; }
+          continue;
+        }
+        if (PeerIp().empty() && gAccepting == 0) { refresh = true; break; }
+      }
+      quit = stop_;
+    }
+    if (pub) try { pub.Stop(); } catch (...) {}
+    pub = nullptr;
+    listener = nullptr;
+    if (quit) break;
+    if (refresh) {
+      backoff = 2;
+      Sleep(400);  // restarting at once sometimes aborts the new publisher
+      continue;
+    }
+    if (GetTickCount64() - began > 60000) backoff = 2;
+    // Radio off, sleep, adapter reset: come back with a capped back-off.
+    std::unique_lock<std::mutex> lk(mx_);
+    if (cv_.wait_for(lk, std::chrono::seconds(backoff), [&] { return stop_; })) break;
+    backoff = std::min(backoff * 2, 60);
+  }
+  DropPeer();
+  running_ = false;
+  {
+    std::lock_guard<std::mutex> lk(mx_);
+    status_ = L"off";
+  }
+  winrt::uninit_apartment();
+}
+
+}  // namespace td

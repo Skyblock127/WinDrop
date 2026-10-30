@@ -1,0 +1,43 @@
+WinDrop: send files, text and clipboard between your Windows PC and Android phone,
+on any network, with no cables and no shared Wi-Fi needed, just like AirDrop on iOS.
+
+What you need
+- Windows 10 or 11 laptop/PC with Wi-Fi and Bluetooth (both switched on)
+- Android 10 or newer phone with Bluetooth on
+
+PC (WinDrop-Setup.exe)
+1. Run WinDrop-Setup.exe and click through it (it asks where to install; the default is fine).
+   It adds WinDrop to the Start menu, the firewall and, if you leave it ticked, to startup.
+2. If Windows shows "Windows protected your PC", click "More info" -> "Run anyway".
+   This appears because the app isn't code-signed yet; it's not a virus warning.
+   If instead it says "Smart App Control blocked an app", see "Smart App Control" below.
+
+Phone (WinDrop.apk)
+1. Open WinDrop.apk on the phone and install it (allow "install unknown apps" if asked).
+2. Open WinDrop, allow everything it asks for (notifications, Nearby devices,
+   Bluetooth, "show over other apps", battery).
+3. On the PC: tray icon -> "Pair phone...". On the phone: tap "Pair with PC".
+   After a few seconds both screens show the same 6-digit number and the PC asks
+   "Pair with <phone>?" - click Yes only if the numbers match.
+4. Pull down Quick Settings, edit tiles, and add the "WinDrop" tile (on/off).
+
+Using it
+- Turn WinDrop on using the tile or the app, on phone.
+- PC -> phone: drag a file to the very top-center edge of the screen and drop it on the pill,
+  or right-click -> Send to -> Phone (WinDrop), or Ctrl+Alt+P to send the clipboard
+  (text, files, screenshots).
+- Phone -> PC: Share -> WinDrop, or the "Send clipboard to PC" button / notification.
+- Received files: Downloads\WinDrop on both sides. Text/links/screenshots also go to the clipboard.
+
+Good to know
+- Pair each phone with its own PC (one phone per PC).
+- Everything is encrypted (AES-256) with a key only your paired phone and PC have; no other
+  device can send to you or read what you send.
+- If pairing never shows the number: turn the phone's Wi-Fi off and on, then try again.
+- Uninstall from Settings -> Apps like any other app.
+
+Smart App Control
+Some Windows 11 PCs have Smart App Control on, which blocks every app that isn't code-signed,
+with no "Run anyway". The only way past it is turning Smart App Control off
+(Windows Security -> App & browser control -> Smart App Control), and Windows won't let you
+turn it back on without resetting the PC. Only do that if you're comfortable with it.
