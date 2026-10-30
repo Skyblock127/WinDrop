@@ -16,12 +16,19 @@ class OutboxManager(context: Context) {
 
     private val sp = context.getSharedPreferences("outbox", Context.MODE_PRIVATE)
     private val dir = File(context.filesDir, "outbox").apply { mkdirs() }
-    val listeners = CopyOnWriteArrayList<() -> Unit>()
 
-    @Synchronized
-    fun list(): List<Entry> {
+    // The service and the app screen each make their own OutboxManager over the same storage, so
+    // the lock and the change listeners are shared: a send the service finishes updates the screen.
+    val listeners get() = sharedListeners
+
+    companion object {
+        private val sharedListeners = CopyOnWriteArrayList<() -> Unit>()
+        private val lock = Any()
+    }
+
+    fun list(): List<Entry> = synchronized(lock) {
         val arr = JSONArray(sp.getString("items", "[]"))
-        return (0 until arr.length()).map { i ->
+        (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             Entry(
                 o.getLong("id"), o.getString("name"), o.optBoolean("text"),
@@ -33,7 +40,6 @@ class OutboxManager(context: Context) {
 
     val count: Int get() = list().size
 
-    @Synchronized
     private fun save(items: List<Entry>) {
         val arr = JSONArray()
         for (e in items) {
@@ -43,11 +49,11 @@ class OutboxManager(context: Context) {
                 e.path?.let { put("path", it) }
             })
         }
-        sp.edit().putString("items", arr.toString()).apply()
-        listeners.forEach { it() }
+        synchronized(lock) { sp.edit().putString("items", arr.toString()).apply() }
+        sharedListeners.forEach { it() }
     }
 
-    private fun nextId() = synchronized(this) {
+    private fun nextId() = synchronized(lock) {
         val id = sp.getLong("next_id", 1)
         sp.edit().putLong("next_id", id + 1).apply()
         id
@@ -55,7 +61,7 @@ class OutboxManager(context: Context) {
 
     fun addText(text: String): Entry {
         val e = Entry(nextId(), "Text", true, text, null, text.toByteArray().size.toLong())
-        synchronized(this) { save(list() + e) }
+        synchronized(lock) { save(list() + e) }
         return e
     }
 
@@ -65,19 +71,17 @@ class OutboxManager(context: Context) {
         val f = File(dir, "${id}_" + name.replace(Regex("[/\\\\]"), "_"))
         input.use { src -> f.outputStream().use { src.copyTo(it, Proto.CHUNK) } }
         val e = Entry(id, name, false, null, f.absolutePath, f.length())
-        synchronized(this) { save(list() + e) }
+        synchronized(lock) { save(list() + e) }
         return e
     }
 
-    @Synchronized
-    fun remove(id: Long) {
+    fun remove(id: Long) = synchronized(lock) {
         val items = list()
         items.find { it.id == id }?.path?.let { File(it).delete() }
         save(items.filter { it.id != id })
     }
 
-    @Synchronized
-    fun clear() {
+    fun clear() = synchronized(lock) {
         list().forEach { e -> e.path?.let { File(it).delete() } }
         save(emptyList())
     }
