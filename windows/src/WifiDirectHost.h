@@ -49,6 +49,10 @@ class WifiDirectHost {
     return GetTickCount64() < prewarmUntil_ ? prewarmPhone_ : "";
   }
   std::function<void()> onLinkUp;  // called on a worker thread once the phone's link is usable
+  // Called (worker thread) when a phone got the link but never connected to us over it, which
+  // almost always means a firewall or antivirus on this PC blocks WinDrop.
+  std::function<void()> onUnreachable;
+  void SawConnection(const std::string& ip);  // a TCP connection arrived from this address
 
 
  private:
@@ -65,7 +69,7 @@ class WifiDirectHost {
   bool refresh_ = false;  // re-publish now (fresh listen state) because we're about to need the phone
   std::atomic<ULONGLONG> pairUntil_{0};
   int64_t beaconWindow_ = 0;
-  std::atomic<uint64_t> linkSeq_{0}, authedSeq_{0};
+  std::atomic<uint64_t> linkSeq_{0}, authedSeq_{0}, sawConnSeq_{0};
   std::atomic<ULONGLONG> prewarmUntil_{0};
 };
 

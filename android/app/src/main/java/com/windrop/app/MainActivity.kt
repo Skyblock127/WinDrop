@@ -94,6 +94,7 @@ class MainActivity : Activity() {
     @SuppressLint("SetTextI18n", "UseSwitchCompatOrMaterialCode")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Logs.init(this)
         prefs = Prefs(this)
         outbox = OutboxManager(this)
         window.statusBarColor = BG
@@ -206,6 +207,24 @@ class MainActivity : Activity() {
         updateNote = label("", 15f).apply { setPadding(0, dp(4), 0, 0) }
         upd.addView(updateNote)
         updateBtn = button("Check for updates", upd, filled = false) { onUpdateClicked() }
+        val logRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(10), 0, 0) }
+        upd.addView(logRow)
+        button("Save logs", logRow, filled = false) {
+            Toast.makeText(this, "Saving logs…", Toast.LENGTH_SHORT).show()
+            Thread {
+                val name = Diagnostics.save(this)
+                runOnUiThread {
+                    Toast.makeText(this, if (name != null) "Saved to Downloads/WinDrop/$name" else "Couldn't save the logs", Toast.LENGTH_LONG).show()
+                }
+            }.start()
+        }
+        button("Clear logs", logRow, filled = false) {
+            Thread {
+                Logs.clear()
+                Logs.i("Logs cleared. WinDrop ${Crypto.appVersion}, paired: ${prefs.paired}")
+                runOnUiThread { Toast.makeText(this, "Logs cleared. Try again, then Save logs.", Toast.LENGTH_LONG).show() }
+            }.start()
+        }
 
         setContentView(ScrollView(this).apply {
             setBackgroundColor(BG)

@@ -43,7 +43,15 @@ Pairing is a P-256 key exchange confirmed by a 6-digit number on both screens. A
 - **Android:** `cd android && ./gradlew assembleRelease` (JDK 17+). Release signing reads `~/.windrop-signing/keystore.properties`; without it, the debug key is used.
 - **Release:** bump `VERSION`, commit, then `tools\release.ps1 -Publish` (needs Inno Setup 6 and `gh`). It builds both apps and the installer and publishes them as a GitHub release.
 
-Logs: `%LOCALAPPDATA%\WinDrop\windrop.log` on the PC (the phone's log is uploaded there too).
+## Something not working?
+
+Collect logs on both sides and send them along:
+
+1. **Clear logs** (PC: tray icon, Logs; phone: WinDrop app, Clear logs).
+2. Try the thing that fails once more.
+3. **Save logs** on both. The files land in `Downloads\WinDrop` (PC) and `Downloads/WinDrop` (phone). They include a check of firewall, antivirus, VPN and radio settings.
+
+Most pairing failures where the phone says "Couldn't reach your PC" are a firewall or antivirus on the PC. In Windows Security, Firewall & network protection, Public network, "Blocks all incoming connections" must be off. An antivirus with its own firewall needs WinDrop allowed too.
 
 ## License
 

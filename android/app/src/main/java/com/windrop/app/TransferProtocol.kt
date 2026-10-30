@@ -73,7 +73,11 @@ object Proto {
 object PeerResolver {
     class Connection(val socket: Socket, val address: InetSocketAddress)
 
+    /** Why the last connect() found nothing (for the logs). */
+    @Volatile var lastError: String = ""
+
     fun connect(candidates: List<InetSocketAddress>, timeoutMs: Int = 800): Connection? {
+        lastError = if (candidates.isEmpty()) "no link to the PC" else "timed out"
         if (candidates.isEmpty()) return null
         val results = LinkedBlockingQueue<Pair<InetSocketAddress, Socket?>>()
         for (a in candidates) {
@@ -84,6 +88,7 @@ object PeerResolver {
                     results.put(a to s)
                 } catch (e: Exception) {
                     runCatching { s.close() }
+                    lastError = "$a: ${e.javaClass.simpleName}: ${e.message}"
                     results.put(a to null)
                 }
             }

@@ -22,6 +22,7 @@ add_executable(WinDrop WIN32
   src/WifiDirectHost.cpp
   src/Crypto.cpp
   src/Updater.cpp
+  src/Diagnostics.cpp
   res/app.rc
 )
 

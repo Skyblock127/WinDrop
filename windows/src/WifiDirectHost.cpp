@@ -172,10 +172,18 @@ void WifiDirectHost::LinkUp() {
   std::thread([this, seq] {
     Sleep(kAuthGraceMs);
     if (linkSeq_ == seq && authedSeq_ != seq && !PeerIp().empty()) {
-      Log("wfd: link never proved it's the paired phone, dropping it");
+      if (sawConnSeq_ != seq) {
+        Log("wfd: the phone never connected over the link: a firewall or antivirus on this PC is probably blocking WinDrop");
+        if (onUnreachable) onUnreachable();
+      }
+      Log("wfd: link never proved it's a paired phone, dropping it");
       DropPeer();
     }
   }).detach();
+}
+
+void WifiDirectHost::SawConnection(const std::string& ip) {
+  if (!ip.empty() && ip == PeerIp()) sawConnSeq_ = linkSeq_.load();
 }
 
 void WifiDirectHost::MarkAuthenticated(const std::string& phoneId) {

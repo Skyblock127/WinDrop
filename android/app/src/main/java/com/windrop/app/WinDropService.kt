@@ -180,6 +180,7 @@ class WinDropService : Service() {
     // ---- lifecycle ----
     override fun onCreate() {
         super.onCreate()
+        Logs.init(this)
         instance = this
         prefs = Prefs(this)
         outbox = OutboxManager(this)
@@ -190,7 +191,8 @@ class WinDropService : Service() {
         p2p = WifiDirectLink(this, prefs, onPcAddress = { ip ->
             // Joined (or lost) the PC's Wi-Fi Direct group: say hello over it and drain the outbox.
             if (ip != null) {
-                Logs.i("link up, PC at $ip")
+                Logs.i("link up, PC at $ip; VPN active: ${Diagnostics.vpnActive(this)}")
+                Logs.i(Diagnostics.interfaces().replace('\n', ';'))
                 lastActivity = System.currentTimeMillis()
                 // While pairing, the old key (if any) is about to be replaced: wait for the new one.
                 if (!pairing) { flushOutbox(); uploadLogs() }
@@ -794,7 +796,24 @@ class WinDropService : Service() {
         deadline = System.currentTimeMillis() + 120_000
         while (p2p.connectedIp == null && System.currentTimeMillis() < deadline && !stopped) Thread.sleep(300)
         if (p2p.connectedIp == null) return false to "Couldn't connect to ${prefs.pcP2pName}. Try turning the phone's Wi-Fi off and on."
-        val conn = PeerResolver.connect(candidates(), 2000) ?: return false to "Couldn't reach your PC."
+        // The PC's side of a fresh link can take a moment; keep trying for a while before giving up.
+        var conn: PeerResolver.Connection? = null
+        val until = System.currentTimeMillis() + 12_000
+        var tries = 0
+        while (conn == null && System.currentTimeMillis() < until && !stopped && p2p.connectedIp != null) {
+            tries++
+            conn = PeerResolver.connect(candidates(), 2000)
+            if (conn == null) {
+                Logs.w("pairing: connecting to the PC at ${p2p.connectedIp}:${Proto.TCP_PORT} failed (try $tries): ${PeerResolver.lastError}")
+                Thread.sleep(800)
+            }
+        }
+        if (conn == null) {
+            Logs.w("pairing: the PC never answered over the link; VPN active: ${Diagnostics.vpnActive(this)}")
+            return false to "Couldn't reach your PC. A firewall or antivirus on the PC is probably blocking WinDrop" +
+                (if (Diagnostics.vpnActive(this)) ", or the VPN on this phone is." else ".")
+        }
+        Logs.i("pairing: connected to the PC at ${conn.address}")
         conn.socket.use { s ->
             tune(s)
             s.soTimeout = 75_000  // the PC waits up to a minute for its user to confirm

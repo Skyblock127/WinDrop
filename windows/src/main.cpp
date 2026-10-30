@@ -19,6 +19,7 @@ using std::min;
 #include "NetworkEngine.h"
 #include "Settings.h"
 #include "TopOverlayWindow.h"
+#include "Diagnostics.h"
 #include "Updater.h"
 #include "WifiDirectHost.h"
 
@@ -42,12 +43,16 @@ enum : UINT {
   IDM_EXIT,
   IDM_QUEUE_CLEAR,
   IDM_UPDATE,
+  IDM_SAVELOGS,
+  IDM_CLEARLOGS,
   IDM_QUEUE_ITEM = 1000,   // + index into gMenuQueue
   IDM_PHONE_REMOVE = 1100, // + index into gMenuPhones  // + index into gMenuQueue
 };
 
 constexpr UINT WM_APP_UPDATE = WM_APP + 40;         // wParam: 1 = asked by the user; lParam: UpdateInfo* (null = check failed)
 constexpr UINT WM_APP_UPDATE_FAILED = WM_APP + 41;  // lParam: std::wstring* error
+constexpr UINT WM_APP_LOGS = WM_APP + 42;         // lParam: std::wstring* saved path (null = failed)
+constexpr UINT WM_APP_UNREACHABLE = WM_APP + 43;  // a phone got the link but couldn't connect to us
 constexpr UINT_PTR kTimerUpdate = 7;
 constexpr UINT kUpdateEveryMs = 6 * 60 * 60 * 1000;
 
@@ -416,6 +421,10 @@ void ShowMenu() {
     AppendMenuW(m, MF_POPUP, (UINT_PTR)ph, L"Phones");
   }
   AppendMenuW(m, MF_STRING, IDM_OPENDIR, L"Open received folder");
+  HMENU logs = CreatePopupMenu();
+  AppendMenuW(logs, MF_STRING, IDM_SAVELOGS, L"Save logs to Downloads");
+  AppendMenuW(logs, MF_STRING, IDM_CLEARLOGS, L"Clear logs");
+  AppendMenuW(m, MF_POPUP, (UINT_PTR)logs, L"Logs");
   AppendMenuW(m, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), IDM_STARTUP, L"Start with Windows");
   std::wstring upd = gUpdate.version.empty() ? L"Check for updates (v" + U2W(WINDROP_VERSION) + L")"
                                              : L"Update to v" + U2W(gUpdate.version) + L"…";
@@ -453,6 +462,27 @@ void OnCommand(UINT id) {
     case IDM_PAIR:
       ShowPairCode();
       break;
+    case IDM_SAVELOGS:
+      gOverlay.Notify(L"Saving logs…", L"Checking the firewall and network too; takes a few seconds");
+      std::thread([] {
+        std::wstring path;
+        bool ok = SaveLogs(&path);
+        PostMessageW(gMain, WM_APP_LOGS, 0, ok ? (LPARAM) new std::wstring(path) : 0);
+      }).detach();
+      break;
+    case IDM_CLEARLOGS: {
+      std::wstring dir;
+      {
+        std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+        dir = Cfg().dataDir;
+      }
+      DeleteFileW((dir + L"\\windrop.log").c_str());
+      DeleteFileW((dir + L"\\windrop.log.1").c_str());
+      Log("Logs cleared. WinDrop %s, phones paired: %zu, Wi-Fi Direct: %s", WINDROP_VERSION, Phones().size(),
+          W2U(TheWifiDirect().Status()).c_str());
+      gOverlay.Notify(L"Logs cleared", L"Do the thing that fails, then Logs → Save logs to Downloads");
+      break;
+    }
     case IDM_OPENDIR:
       CreateDirectoryW(Cfg().downloadDir.c_str(), nullptr);
       ShellExecuteW(nullptr, L"open", Cfg().downloadDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -570,6 +600,21 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND:
       OnCommand(LOWORD(w));
       return 0;
+    case WM_APP_LOGS: {
+      std::unique_ptr<std::wstring> path((std::wstring*)l);
+      if (!path) {
+        gOverlay.Notify(L"Couldn't save the logs", L"", true);
+      } else {
+        gOverlay.Notify(L"Logs saved to Downloads\\WinDrop", L"Send that file to whoever is helping you");
+        std::wstring args = L"/select,\"" + *path + L"\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+      }
+      return 0;
+    }
+    case WM_APP_UNREACHABLE:
+      gOverlay.Notify(L"Your phone couldn't reach this PC",
+                      L"A firewall or antivirus is blocking WinDrop: allow it for Public networks", true);
+      return 0;
     case WM_APP_UPDATE:
       OnUpdateChecked(w != 0, (UpdateInfo*)l);
       return 0;
@@ -660,6 +705,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
   gOverlay.Create(inst, &gNet);
   TheWifiDirect().onLinkUp = [] { gNet.OnLinkUp(); };
+  TheWifiDirect().onUnreachable = [] { PostMessageW(gMain, WM_APP_UNREACHABLE, 0, 0); };
   if (!gNet.Start(gMain)) gOverlay.Notify(L"WinDrop can't listen on port 53318", L"Is another copy running?", true);
   AddTray();
   EnsureShortcuts();

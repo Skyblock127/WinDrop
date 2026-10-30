@@ -481,6 +481,8 @@ void NetworkEngine::ServerLoop() {
       continue;
     }
     Tune(c);
+    Log("incoming connection from %s", IpStr(a.sin_addr).c_str());
+    TheWifiDirect().SawConnection(IpStr(a.sin_addr));
     HandleIncoming(c, IpStr(a.sin_addr));
     // Close politely: closing with the client's bytes still unread sends a reset, which can
     // swallow our last reply (say, "incompatible version") before the other side reads it.
