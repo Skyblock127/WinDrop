@@ -177,7 +177,6 @@ std::wstring QueueLabel(const OutboxItem& it) {
   } else {
     s = FileNameOf(it.path);
   }
-  if (Phones().size() > 1) s = PhoneLabel(it.phoneId) + L" ← " + s;
   if (s.size() > 48) s = s.substr(0, 47) + L"…";
   std::wstring out;  // a lone & would underline the next letter
   for (auto c : s) {
@@ -196,10 +195,27 @@ HMENU QueueMenu(size_t* count) {
     return q;
   }
   AppendMenuW(q, MF_STRING | MF_GRAYED, 0, L"Sent when the phone is in reach · click one to remove it");
-  AppendMenuW(q, MF_SEPARATOR, 0, nullptr);
+  // Grouped by phone (in pairing order), each under its own heading with its own count.
+  auto phones = Phones();
+  auto rank = [&](const std::string& id) {
+    for (size_t i = 0; i < phones.size(); ++i)
+      if (phones[i].id == id) return i;
+    return phones.size();
+  };
+  std::stable_sort(gMenuQueue.begin(), gMenuQueue.end(),
+                   [&](const OutboxItem& a, const OutboxItem& b) { return rank(a.phoneId) < rank(b.phoneId); });
   size_t shown = std::min<size_t>(gMenuQueue.size(), 30);
-  for (size_t i = 0; i < shown; ++i)
-    AppendMenuW(q, MF_STRING, IDM_QUEUE_ITEM + UINT(i), QueueLabel(gMenuQueue[i]).c_str());
+  for (size_t i = 0; i < shown; ++i) {
+    const auto& it = gMenuQueue[i];
+    if (i == 0 || it.phoneId != gMenuQueue[i - 1].phoneId) {
+      AppendMenuW(q, MF_SEPARATOR, 0, nullptr);
+      if (phones.size() > 1) {
+        size_t n = std::count_if(gMenuQueue.begin(), gMenuQueue.end(), [&](const OutboxItem& o) { return o.phoneId == it.phoneId; });
+        AppendMenuW(q, MF_STRING | MF_GRAYED, 0, (L"For " + PhoneLabel(it.phoneId) + L" (" + std::to_wstring(n) + L")").c_str());
+      }
+    }
+    AppendMenuW(q, MF_STRING, IDM_QUEUE_ITEM + UINT(i), QueueLabel(it).c_str());
+  }
   if (gMenuQueue.size() > shown)
     AppendMenuW(q, MF_STRING | MF_GRAYED, 0, (L"…and " + std::to_wstring(gMenuQueue.size() - shown) + L" more").c_str());
   AppendMenuW(q, MF_SEPARATOR, 0, nullptr);

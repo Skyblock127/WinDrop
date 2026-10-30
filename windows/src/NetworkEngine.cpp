@@ -283,7 +283,8 @@ void NetworkEngine::SenderLoop() {
         std::lock_guard<std::mutex> lk(tmx_);
         if (waking_.empty()) { waking_ = job.phoneId; wakingSince_ = GetTickCount64(); }
       }
-      e->count = TheOutbox().Count();
+      e->count = 0;  // waiting for this phone only; other phones have their own queues
+      for (auto& w : TheOutbox().Snapshot()) e->count += w.phoneId == job.phoneId;
       e->name = name;
       Post(e);
       std::lock_guard<std::mutex> lk(tmx_);
