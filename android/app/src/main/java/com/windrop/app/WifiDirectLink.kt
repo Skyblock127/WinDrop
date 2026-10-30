@@ -181,6 +181,11 @@ class WifiDirectLink(
                 main.removeCallbacks(giveUp)
                 setPc(info.groupOwnerAddress.hostAddress)
             } else {
+                if (info != null && info.groupFormed && info.isGroupOwner && connecting) {
+                    // Our join made the phone the group owner: the PC can't work that way. Undo it.
+                    Logs.w("p2p: phone became group owner; removing the group")
+                    runCatching { mgr?.removeGroup(ch, null) }
+                }
                 setPc(null)
                 // A join in progress already has its timeout queued; only start one if nothing is.
                 if (wanted && !main.hasCallbacks(retry)) schedule(0)
@@ -289,6 +294,8 @@ class WifiDirectLink(
                 Logs.w("p2p connect failed: $reason")
                 connecting = false
                 if (reason == WifiP2pManager.BUSY) runCatching { mgr.cancelConnect(ch, null) }
+                // Discovery stopped with the connect: search again now, not when the window ends.
+                schedule(1000)
             }
         })
     }

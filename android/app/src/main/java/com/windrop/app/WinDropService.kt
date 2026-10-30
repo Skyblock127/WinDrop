@@ -774,6 +774,8 @@ class WinDropService : Service() {
         Logs.i("pairing started")
         prefs.pcP2pName = ""      // learn it fresh from the pairing beacon
         prefs.pcP2pAddress = ""
+        // A link to some PC may be up already; pairing must open a fresh one to the PC in pairing mode.
+        main.post { p2p.release() }
         ble.start()
         ble.reset()  // a pairing beacon seen just before the tap must count now
         io.execute {
@@ -781,7 +783,10 @@ class WinDropService : Service() {
             pairing = false
             p2p.pairingMode = false
             Logs.i("pairing: $msg")
-            main.post { onDone(ok, msg); updateServiceNotification(); notifyListeners() }
+            main.post {
+                if (!ok) p2p.release()  // don't keep chasing a link the next attempt has to start over
+                onDone(ok, msg); updateServiceNotification(); notifyListeners()
+            }
         }
     }
 

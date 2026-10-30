@@ -26,6 +26,8 @@ class WifiDirectHost {
   std::string LinkedPhone();  // the paired phone on the link, empty if none (or not proven yet)
   // Transfers in progress over the link; a busy link isn't handed to another phone.
   std::atomic<int> busy{0};
+  // Pairing exchanges in progress; the link isn't dropped while the user checks the number.
+  std::atomic<int> pairExchanges{0};
   static constexpr DWORD kAuthGraceMs = 15000;
   // Bluetooth LE beacon: manufacturer data "TD" + code[0..4] + flag + this PC's Wi-Fi Direct name.
   // Pending (flag 1) asks the phone to open the link now; presence (flag 0) only lets a phone that

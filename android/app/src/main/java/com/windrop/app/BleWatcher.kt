@@ -38,7 +38,7 @@ class BleWatcher(
         var name = ""
         var pending = false
         when (kind) {
-            "WP" -> name = String(d, 3, d.size - 3, Charsets.UTF_8).trim()
+            "WP" -> name = String(d, 3, d.size - 3, Charsets.UTF_8).trim { it <= ' ' }
             "WD" -> {
                 if (d.size < 9 || d[8].toInt() != 1) return
                 val key = prefs.pairKey ?: return
@@ -65,7 +65,7 @@ class BleWatcher(
 
     private val cb = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) = dispatch(result)
-        override fun onBatchScanResults(results: MutableList<ScanResult>) { results.lastOrNull()?.let { dispatch(it) } }
+        override fun onBatchScanResults(results: MutableList<ScanResult>) { results.forEach { dispatch(it) } }
         override fun onScanFailed(errorCode: Int) { Logs.w("ble scan failed: $errorCode"); scanning = false }
     }
 

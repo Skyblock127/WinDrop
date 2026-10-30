@@ -669,6 +669,10 @@ void NetworkEngine::HandlePair(SOCKET c) {
     return;
   }
 
+  struct Exchange {
+    Exchange() { TheWifiDirect().pairExchanges++; }
+    ~Exchange() { TheWifiDirect().pairExchanges--; }
+  } exchange;
   EcdhKey ec;
   Bytes pubS = ec.PublicKey(), nS = RandomBytes(16);
   std::string myId, myName;
@@ -774,10 +778,12 @@ void NetworkEngine::TickerLoop() {
       waking_ = (i + 1 == waiting.end()) ? waiting.front() : *(i + 1);
       wakingSince_ = now;
     }
+    // Pairing comes first: a phone being paired waits for the pairing beacon and never sees it while
+    // we're calling some other phone about its queue.
     wfd.SetBeacon(!enabled ? WifiDirectHost::kBeaconOff
-                  : !waking_.empty() ? WifiDirectHost::kBeaconPending
                   : wfd.Pairing() ? WifiDirectHost::kBeaconPresence
-                                  : WifiDirectHost::kBeaconOff,
+                  : !waking_.empty() ? WifiDirectHost::kBeaconPending
+                                     : WifiDirectHost::kBeaconOff,
                   waking_);
 
     // A link to a phone with nothing left to do, while another phone waits: hand it over.

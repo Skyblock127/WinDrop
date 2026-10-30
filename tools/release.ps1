@@ -33,6 +33,9 @@ if (-not $env:JAVA_HOME) { $env:JAVA_HOME = Find-First @("$env:ProgramFiles\Andr
 Push-Location android
 .\gradlew.bat --quiet assembleRelease
 $ok = $LASTEXITCODE -eq 0
+# The Gradle daemon outlives the build and keeps this script's output pipe open, so a caller
+# piping our output would wait on it forever.
+.\gradlew.bat --quiet --stop | Out-Null
 Pop-Location
 if (-not $ok) { throw "Android build failed" }
 

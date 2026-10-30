@@ -101,12 +101,12 @@ void Accept(WiFiDirectConnectionRequest const& req) {
     return;
   }
   try {
+    WiFiDirectConnectionParameters params;
+    params.GroupOwnerIntent(15);  // PC stays group owner so the phone keeps its own Wi-Fi
+    params.PreferenceOrderedConfigurationMethods().Append(WiFiDirectConfigurationMethod::PushButton);
     if (!info.Pairing().IsPaired()) {
       auto custom = info.Pairing().Custom();
       auto token = custom.PairingRequested([](auto const&, DevicePairingRequestedEventArgs const& a) { a.Accept(); });
-      WiFiDirectConnectionParameters params;
-      params.GroupOwnerIntent(15);  // PC stays group owner so the phone keeps its own Wi-Fi
-      params.PreferenceOrderedConfigurationMethods().Append(WiFiDirectConfigurationMethod::PushButton);
       auto op = custom.PairAsync(DevicePairingKinds::ConfirmOnly, DevicePairingProtectionLevel::Default, params);
       // A radio hiccup on the phone can leave this hanging; don't let it block the next attempt.
       if (op.wait_for(std::chrono::seconds(25)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
@@ -126,14 +126,23 @@ void Accept(WiFiDirectConnectionRequest const& req) {
         return;
       }
     }
-    auto open = WiFiDirectDevice::FromIdAsync(info.Id());
+    auto open = WiFiDirectDevice::FromIdAsync(info.Id(), params);
+    // A failed open usually means Windows' saved pairing for this phone went stale: drop it so the
+    // next attempt pairs afresh instead of failing the same way.
     if (open.wait_for(std::chrono::seconds(20)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
       open.Cancel();
       Log("wfd: opening the link timed out");
+      Unpair(info.Id());
+      TheWifiDirect().Refresh();
       return;
     }
     auto dev = open.GetResults();
-    if (!dev) { Log("wfd: FromIdAsync returned null"); return; }
+    if (!dev) {
+      Log("wfd: FromIdAsync returned null");
+      Unpair(info.Id());
+      TheWifiDirect().Refresh();
+      return;
+    }
     std::string ip;
     for (auto const& pair : dev.GetConnectionEndpointPairs()) {
       ip = W2U(std::wstring(pair.RemoteHostName().CanonicalName()));
@@ -173,6 +182,8 @@ void WifiDirectHost::LinkUp() {
   uint64_t seq = ++linkSeq_;
   std::thread([this, seq] {
     Sleep(kAuthGraceMs);
+    // A pairing phone proves itself only once the user clicks Yes, which can take up to a minute.
+    while (linkSeq_ == seq && authedSeq_ != seq && pairExchanges > 0) Sleep(500);
     if (linkSeq_ == seq && authedSeq_ != seq && !PeerIp().empty()) {
       if (sawConnSeq_ != seq) {
         Log("wfd: the phone never connected over the link: a firewall or antivirus on this PC is probably blocking WinDrop");
@@ -239,7 +250,10 @@ std::string WfdName() {
   wchar_t n[MAX_COMPUTERNAME_LENGTH + 1];
   DWORD len = ARRAYSIZE(n);
   std::string s = GetComputerNameW(n, &len) ? W2U(n) : "";
-  return s.substr(0, 17);
+  if (s.size() <= 17) return s;
+  size_t cut = 17;
+  while (cut > 0 && (uint8_t(s[cut]) & 0xC0) == 0x80) --cut;  // don't split a UTF-8 character
+  return s.substr(0, cut);
 }
 
 // Beacon payloads (manufacturer data, company 0xFFFF):
@@ -364,9 +378,10 @@ void WifiDirectHost::Loop() {
     {
       std::unique_lock<std::mutex> lk(mx_);
       // Windows quietly stops answering P2P probes a few minutes after Start(); while no phone is
-      // linked, re-publish periodically so the phone can always find us (more often while pairing).
+      // linked, re-publish periodically so the phone can always find us (more often while pairing,
+      // but not so often that a restart keeps landing in the middle of the phone's connect).
       for (;;) {
-        auto every = std::chrono::seconds(Pairing() ? 30 : 90);
+        auto every = std::chrono::seconds(Pairing() ? 60 : 90);
         if (cv_.wait_for(lk, every, [&] { return stop_ || aborted.load() || refresh_; })) {
           if (stop_ || aborted) break;
           if (PeerIp().empty() && gAccepting == 0) { refresh_ = false; refresh = true; break; }

@@ -145,6 +145,12 @@ class MainActivity : Activity() {
         pair.addView(pcName)
         pairBtn = button("Pair with PC", pair, filled = true) {
             if (pairingNow) return@button
+            if (missingPairPermissions().isNotEmpty()) {
+                // Without these the Bluetooth scan and Wi-Fi Direct search can't run: ask, then pair.
+                pairAfterPermissions = true
+                requestRuntimePermissions()
+                return@button
+            }
             requestRuntimePermissions()
             if (!prefs.enabled || WinDropService.instance == null) WinDropService.start(this)
             pairingNow = true
@@ -325,6 +331,10 @@ class MainActivity : Activity() {
 
     private fun missingPermissions() = runtimePermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
 
+    /** The ones pairing can't do without (notifications are optional). */
+    private fun missingPairPermissions() = missingPermissions().filter { it != Manifest.permission.POST_NOTIFICATIONS }
+    private var pairAfterPermissions = false
+
     private fun requestRuntimePermissions() {
         val missing = missingPermissions()
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
@@ -334,6 +344,11 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         WinDropService.instance?.onSetupChanged()
         render()
+        if (pairAfterPermissions) {
+            pairAfterPermissions = false
+            if (missingPairPermissions().isEmpty()) pairBtn.performClick()
+            else android.widget.Toast.makeText(this, "Pairing needs the Nearby devices and Bluetooth permissions.", android.widget.Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun onResume() {
