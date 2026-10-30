@@ -51,9 +51,13 @@ Get-ChildItem dist | Format-Table Name, @{n = 'MB'; e = { [math]::Round($_.Lengt
 if ($Publish) {
   $tag = "v$version"
   $notes = @"
-**Download:** [Windows (WinDrop-Setup.exe)](https://github.com/Skyblock127/WinDrop/releases/download/$tag/WinDrop-Setup.exe) · [Android (WinDrop.apk)](https://github.com/Skyblock127/WinDrop/releases/download/$tag/WinDrop.apk) · [Both (WinDrop.zip)](https://github.com/Skyblock127/WinDrop/releases/download/$tag/WinDrop.zip)
+Downloads:
 
-Install the exe on the PC and the apk on the phone, then pair: PC tray → **Pair phone…**, phone → **Pair with PC**. See the [README](https://github.com/Skyblock127/WinDrop#install) for details.
+- Windows: [WinDrop-Setup.exe](https://github.com/Skyblock127/WinDrop/releases/download/$tag/WinDrop-Setup.exe)
+- Android: [WinDrop.apk](https://github.com/Skyblock127/WinDrop/releases/download/$tag/WinDrop.apk)
+- Both: [WinDrop.zip](https://github.com/Skyblock127/WinDrop/releases/download/$tag/WinDrop.zip)
+
+Install the exe on the PC and the apk on the phone, then pair: on the PC, tray icon, Pair phone; on the phone, Pair with PC. Setup details are in the [README](https://github.com/Skyblock127/WinDrop#setup).
 "@
   $ErrorActionPreference = 'Continue'  # "release not found" on stderr is an answer here, not a failure
   gh release view $tag *> $null
