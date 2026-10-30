@@ -788,12 +788,12 @@ class WinDropService : Service() {
     private fun pairOverLink(onSas: (String) -> Unit): Pair<Boolean, String> {
         val noPc = "No PC is in pairing mode. On the PC: tray icon \u2192 Pair phone\u2026, then try again."
         // 1. Find a PC with pairing open (its Bluetooth beacon carries its name).
-        var deadline = System.currentTimeMillis() + 20_000
+        var deadline = System.currentTimeMillis() + 60_000
         while (prefs.pcP2pName.isEmpty() && System.currentTimeMillis() < deadline && !stopped) Thread.sleep(200)
         if (prefs.pcP2pName.isEmpty()) return false to noPc
         // 2. Open the Wi-Fi Direct link to it.
         main.post { p2p.pairingMode = true; p2p.want(); showConnecting() }
-        deadline = System.currentTimeMillis() + 120_000
+        deadline = System.currentTimeMillis() + 150_000
         while (p2p.connectedIp == null && System.currentTimeMillis() < deadline && !stopped) Thread.sleep(300)
         if (p2p.connectedIp == null) return false to "Couldn't connect to ${prefs.pcP2pName}. Try turning the phone's Wi-Fi off and on."
         // The PC's side of a fresh link can take a moment; keep trying for a while before giving up.

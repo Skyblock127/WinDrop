@@ -76,7 +76,7 @@ class WifiDirectLink(
         if (!wanted) Logs.i("p2p wanted")
         wanted = true
         main.removeCallbacks(giveUp)
-        if (pcIp == null) main.postDelayed(giveUp, GIVE_UP_MS)
+        if (pcIp == null) main.postDelayed(giveUp, if (pairingMode) PAIRING_GIVE_UP_MS else GIVE_UP_MS)
         kick()
     }
 
@@ -338,6 +338,8 @@ class WifiDirectLink(
         private const val REDISCOVER_MS = 6_000L
         private const val CONNECT_TIMEOUT = 15_000L
         private const val GIVE_UP_MS = 90_000L
+        // Pairing: the PC's first Wi-Fi Direct attempt sometimes fails; leave room for retries.
+        private const val PAIRING_GIVE_UP_MS = 150_000L
         private const val SENTINEL_INTENT = 13
         private const val NET_ID_PERSISTENT = -2
         private const val NET_ID_TEMPORARY = -1

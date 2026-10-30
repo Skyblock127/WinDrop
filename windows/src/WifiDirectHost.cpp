@@ -113,6 +113,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
         op.Cancel();
         custom.PairingRequested(token);
         Log("wfd: pairing timed out");
+        TheWifiDirect().Refresh();  // the phone retries: be findable again straight away
         Unpair(info.Id());
         return;
       }
@@ -121,6 +122,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
       Log("wfd: pairing result %d", (int)r.Status());
       if (r.Status() != DevicePairingResultStatus::Paired && r.Status() != DevicePairingResultStatus::AlreadyPaired) {
         Unpair(info.Id());  // half-made pairing would block the next attempt
+        TheWifiDirect().Refresh();
         return;
       }
     }
@@ -198,8 +200,15 @@ std::string WifiDirectHost::LinkedPhone() {
   return authedSeq_ == linkSeq_ ? authedPhone_ : "";
 }
 
+void WifiDirectHost::Refresh() {
+  std::lock_guard<std::mutex> lk(mx_);
+  refresh_ = true;
+  cv_.notify_all();
+}
+
 void WifiDirectHost::OpenPairWindow() {
   pairUntil_ = GetTickCount64() + 180000;
+  Refresh();  // a phone is about to search for us
   std::lock_guard<std::mutex> lk(gPeerMx);
   gRejectedUntil.clear();
 }
@@ -355,12 +364,17 @@ void WifiDirectHost::Loop() {
     {
       std::unique_lock<std::mutex> lk(mx_);
       // Windows quietly stops answering P2P probes a few minutes after Start(); while no phone is
-      // linked, re-publish periodically so the phone can always find us.
+      // linked, re-publish periodically so the phone can always find us (more often while pairing).
       for (;;) {
-        if (cv_.wait_for(lk, std::chrono::seconds(90), [&] { return stop_ || aborted.load() || refresh_; })) {
+        auto every = std::chrono::seconds(Pairing() ? 30 : 90);
+        if (cv_.wait_for(lk, every, [&] { return stop_ || aborted.load() || refresh_; })) {
           if (stop_ || aborted) break;
-          refresh_ = false;
-          if (PeerIp().empty() && gAccepting == 0) { refresh = true; break; }
+          if (PeerIp().empty() && gAccepting == 0) { refresh_ = false; refresh = true; break; }
+          if (!PeerIp().empty()) { refresh_ = false; continue; }  // linked: nothing to refresh
+          // Still handling a connection request: refresh once it's done.
+          lk.unlock();
+          Sleep(500);
+          lk.lock();
           continue;
         }
         if (PeerIp().empty() && gAccepting == 0) { refresh = true; break; }

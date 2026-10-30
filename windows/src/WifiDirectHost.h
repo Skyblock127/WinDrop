@@ -34,6 +34,7 @@ class WifiDirectHost {
   enum Beacon { kBeaconOff, kBeaconPresence, kBeaconPending };
   void SetBeacon(Beacon mode, const std::string& phoneId = "");  // pending: which phone to wake
   void OpenPairWindow();  // also forgets rejected phones: they may be the one being paired
+  void Refresh();         // re-publish now, so a phone searching for us finds us at once
   // The phone on the link isn't paired here: drop it and ignore its requests for 10 minutes.
   void RejectPeer();
   bool Pairing() const { return GetTickCount64() < pairUntil_; }
