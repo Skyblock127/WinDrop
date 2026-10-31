@@ -29,6 +29,8 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- In-app updates: hands the new APK to the system installer (the user confirms). -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Android 12+: once WinDrop has installed itself, its next updates need no extra tap. -->
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
 
     <application
         android:allowBackup="false"

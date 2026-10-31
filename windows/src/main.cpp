@@ -20,6 +20,7 @@ using std::min;
 #include "Settings.h"
 #include "TopOverlayWindow.h"
 #include "Diagnostics.h"
+#include "Radios.h"
 #include "Updater.h"
 #include "WifiDirectHost.h"
 
@@ -45,6 +46,7 @@ enum : UINT {
   IDM_UPDATE,
   IDM_SAVELOGS,
   IDM_CLEARLOGS,
+  IDM_PAIR_STOP,
   IDM_QUEUE_ITEM = 1000,   // + index into gMenuQueue
   IDM_PHONE_REMOVE = 1100, // + index into gMenuPhones  // + index into gMenuQueue
 };
@@ -53,7 +55,10 @@ constexpr UINT WM_APP_UPDATE = WM_APP + 40;         // wParam: 1 = asked by the 
 constexpr UINT WM_APP_UPDATE_FAILED = WM_APP + 41;  // lParam: std::wstring* error
 constexpr UINT WM_APP_LOGS = WM_APP + 42;         // lParam: std::wstring* saved path (null = failed)
 constexpr UINT WM_APP_UNREACHABLE = WM_APP + 43;  // a phone got the link but couldn't connect to us
+constexpr UINT WM_APP_RADIO = WM_APP + 44;        // Wi-Fi or Bluetooth switched on or off
 constexpr UINT_PTR kTimerUpdate = 7;
+constexpr UINT_PTR kTimerPairEnd = 8;    // the pairing window just closed
+constexpr UINT_PTR kTimerPairCheck = 9;  // pairing just opened: did its beacon start?
 constexpr UINT kUpdateEveryMs = 6 * 60 * 60 * 1000;
 
 HINSTANCE gInst;
@@ -199,7 +204,7 @@ HMENU QueueMenu(size_t* count) {
     AppendMenuW(q, MF_STRING | MF_GRAYED, 0, L"Nothing waiting");
     return q;
   }
-  AppendMenuW(q, MF_STRING | MF_GRAYED, 0, L"Sent when the phone is in reach · click one to remove it");
+  AppendMenuW(q, MF_STRING | MF_GRAYED, 0, L"Sent when the phone is in reach · click one to cancel it");
   // Grouped by phone (in pairing order), each under its own heading with its own count.
   auto phones = Phones();
   auto rank = [&](const std::string& id) {
@@ -224,7 +229,7 @@ HMENU QueueMenu(size_t* count) {
   if (gMenuQueue.size() > shown)
     AppendMenuW(q, MF_STRING | MF_GRAYED, 0, (L"…and " + std::to_wstring(gMenuQueue.size() - shown) + L" more").c_str());
   AppendMenuW(q, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(q, MF_STRING, IDM_QUEUE_CLEAR, L"Clear queue");
+  AppendMenuW(q, MF_STRING, IDM_QUEUE_CLEAR, L"Cancel all");
   return q;
 }
 
@@ -294,7 +299,8 @@ void SendClipboard() {
 // ---- tray ----
 void UpdateTray() {
   bool on = Cfg().enabled;
-  std::wstring tip = on ? L"WinDrop — " + PhonesLine() : L"WinDrop — off";
+  std::wstring off = TheRadios().OffText();
+  std::wstring tip = !on ? L"WinDrop — off" : L"WinDrop — " + PhonesLine() + (off.empty() ? L"" : L" · " + off);
   wcsncpy_s(gNid.szTip, tip.c_str(), _TRUNCATE);
   gNid.hIcon = on ? gIconOn : gIconOff;
   gNid.uFlags = NIF_TIP | NIF_ICON | NIF_SHOWTIP;  // v4 icons show no tooltip without NIF_SHOWTIP
@@ -334,13 +340,32 @@ void SetOn(bool on) {
   UpdateTray();
 }
 
-// Opens pairing for 3 minutes; the phone finds us by itself, and the user confirms a 6-digit
-// number that both screens show.
+bool gPairedInWindow = false;  // a phone was paired since "Pair phone\u2026" was last opened
+
+// Opens pairing for 3 minutes (WifiDirectHost::kPairWindowMs); the phone finds us by itself, and
+// the user confirms a 6-digit number that both screens show.
 void ShowPairCode() {
   if (!Cfg().enabled) SetOn(true);  // off, nothing would answer the phone
   TheWifiDirect().OpenPairWindow();
+  gPairedInWindow = false;
+  SetTimer(gMain, kTimerPairEnd, UINT(WifiDirectHost::kPairWindowMs + 500), nullptr);
+  SetTimer(gMain, kTimerPairCheck, 2000, nullptr);  // the beacon starts on the next tick
   Log("ui: pairing window opened");
-  gOverlay.Notify(L"Pairing is open for 3 minutes", L"On your phone: WinDrop \u2192 Pair with PC");
+  // The phone finds this PC over Bluetooth and links over Wi-Fi: say so now, not after it fails.
+  std::wstring off = TheRadios().OffText();
+  if (!off.empty())
+    gOverlay.Notify(off + L": turn it on to pair", L"Pairing is open for 3 minutes and works once it's on", true);
+  else if (TheWifiDirect().Unsupported())
+    gOverlay.Notify(L"This PC's Wi-Fi can't do Wi-Fi Direct", L"WinDrop needs it: update the Wi-Fi driver, then try again", true);
+  else
+    gOverlay.Notify(L"Pairing is open for 3 minutes", L"On your phone: WinDrop \u2192 Pair with PC");
+}
+
+// "2 min left" / "40 s left" on the pairing window, for the tray menu; empty when it's closed.
+std::wstring PairingLeft() {
+  ULONGLONG left = TheWifiDirect().PairingLeftMs();
+  if (!left) return L"";
+  return left > 60000 ? std::to_wstring((left + 59999) / 60000) + L" min left" : std::to_wstring((left + 999) / 1000) + L" s left";
 }
 
 // The "Pair with ...?" prompt (a MessageBoxW on the UI thread).
@@ -411,7 +436,9 @@ void OnUpdateChecked(bool manual, UpdateInfo* found) {
 void ShowMenu() {
   bool on = Cfg().enabled;
   HMENU m = CreatePopupMenu();
-  std::wstring status = on ? PhonesLine() + L"  ·  link: " + TheWifiDirect().Status() : L"WinDrop is off";
+  std::wstring pairing = PairingLeft();
+  std::wstring status = on ? PhonesLine() + L"  ·  link: " + TheWifiDirect().Status() + (pairing.empty() ? L"" : L"  ·  pairing open, " + pairing)
+                           : L"WinDrop is off";
   AppendMenuW(m, MF_STRING | MF_GRAYED, IDM_STATUS, status.c_str());
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(m, MF_STRING | (on ? MF_CHECKED : 0), IDM_ON, L"On");
@@ -432,6 +459,8 @@ void ShowMenu() {
     AppendMenuW(ph, MF_STRING | (gMenuPhones.size() >= kMaxPhones ? MF_GRAYED : 0), IDM_PAIR, L"Pair another phone…");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)ph, L"Phones");
   }
+  // Pairing holds the Bluetooth beacon, so paired phones aren't called meanwhile: let it be ended.
+  if (!pairing.empty()) AppendMenuW(m, MF_STRING, IDM_PAIR_STOP, (L"Stop pairing (" + pairing + L")").c_str());
   AppendMenuW(m, MF_STRING, IDM_OPENDIR, L"Open received folder");
   HMENU logs = CreatePopupMenu();
   AppendMenuW(logs, MF_STRING, IDM_SAVELOGS, L"Save logs to Downloads");
@@ -474,6 +503,11 @@ void OnCommand(UINT id) {
     case IDM_PAIR:
       ShowPairCode();
       break;
+    case IDM_PAIR_STOP:
+      KillTimer(gMain, kTimerPairEnd);
+      Log("ui: pairing stopped");
+      TheWifiDirect().ClosePairWindow();
+      break;
     case IDM_SAVELOGS:
       gOverlay.Notify(L"Saving logs…", L"Checking the firewall and network too; takes a few seconds");
       std::thread([] {
@@ -514,7 +548,7 @@ void OnCommand(UINT id) {
       for (auto& it : TheOutbox().Snapshot()) ids.push_back(it.id);
       gNet.CancelOutbox(ids);
       Log("ui: queue cleared (%zu)", ids.size());
-      gOverlay.Notify(L"Queue cleared", std::to_wstring(ids.size()) + L" item(s) won't be sent");
+      gOverlay.Notify(L"Cancelled " + std::to_wstring(ids.size()) + (ids.size() == 1 ? L" item" : L" items"), L"Won't be sent");
       break;
     }
     default:
@@ -541,7 +575,7 @@ void OnCommand(UINT id) {
         auto& it = gMenuQueue[id - IDM_QUEUE_ITEM];
         gNet.CancelOutbox({it.id});
         Log("ui: removed from queue: %s", it.isText ? "text" : W2U(FileNameOf(it.path)).c_str());
-        gOverlay.Notify(L"Removed from queue", QueueLabel(it));
+        gOverlay.Notify(L"Cancelled", QueueLabel(it) + L" won't be sent");
       }
       break;
   }
@@ -607,6 +641,10 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
       }
       if (e->type == NetEv::PairDone) {
+        if (e->count) {
+          gPairedInWindow = true;
+          KillTimer(gMain, kTimerPairEnd);  // pairing ended with this phone (ClosePairWindow)
+        }
         UpdateTray();
         if (e->count) gOverlay.Notify(L"Paired with " + e->name, L"Transfers are now encrypted");
         else gOverlay.Notify(L"Can't pair " + e->name, L"4 phones are paired already: tray → Phones to remove one", true);
@@ -656,8 +694,33 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (w == kTimerUpdate) {
         SetTimer(gMain, kTimerUpdate, kUpdateEveryMs, nullptr);
         StartUpdateCheck(false);
+      } else if (w == kTimerPairCheck) {
+        KillTimer(gMain, kTimerPairCheck);
+        if (TheWifiDirect().Pairing() && TheRadios().BluetoothOn() && TheWifiDirect().BeaconBroken())
+          gOverlay.Notify(L"This PC's Bluetooth can't broadcast", L"Your phone can't find it to pair: update the Bluetooth driver", true);
+      } else if (w == kTimerPairEnd) {
+        KillTimer(gMain, kTimerPairEnd);
+        if (!gPairedInWindow && !TheWifiDirect().Pairing()) {
+          Log("ui: pairing window closed, no phone paired");
+          gOverlay.Notify(L"Pairing closed", L"No phone was paired. Tray icon → Pair phone… to try again", true);
+        }
       }
       return 0;
+    case WM_APP_RADIO: {
+      // Advertising and beacons follow the switches; say so once when one WinDrop needs goes off.
+      static bool wifiWas = true, btWas = true;  // both counted as on until the first reading
+      bool wifi = TheRadios().WifiOn(), bt = TheRadios().BluetoothOn();
+      if (wifi != wifiWas) TheWifiDirect().Refresh();  // stop advertising, or start again
+      UpdateTray();
+      bool matters = Cfg().enabled && (!Phones().empty() || TheWifiDirect().Pairing());
+      if (matters && wifiWas && !wifi)
+        gOverlay.Notify(TheRadios().OffText(), L"WinDrop can't send or receive until Wi-Fi is back on", true);
+      else if (matters && btWas && !bt)
+        gOverlay.Notify(L"Bluetooth is off", L"Pairing and sending to your phone need it; the phone can still send here", true);
+      wifiWas = wifi;
+      btWas = bt;
+      return 0;
+    }
     case WM_HOTKEY:
       if (w == kHotkeySendClipboard) SendClipboard();
       return 0;
@@ -740,6 +803,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   EnsureShortcuts();
   RefreshStartupPath();
   gOverlay.SetPillShown(Cfg().pillShown);
+  TheRadios().Start([] { PostMessageW(gMain, WM_APP_RADIO, 0, 0); });
   SetOn(Cfg().enabled);
   RegisterHotKey(gMain, kHotkeySendClipboard, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'P');
   if (!sendNow.empty() && Cfg().enabled) gOverlay.Dropped(sendNow, L"");

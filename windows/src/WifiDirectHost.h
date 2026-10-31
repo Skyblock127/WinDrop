@@ -37,11 +37,21 @@ class WifiDirectHost {
   // Cheap to call every tick; only acts on changes.
   enum Beacon { kBeaconOff, kBeaconPresence, kBeaconPending };
   void SetBeacon(Beacon mode, const std::string& phoneId = "");  // pending: which phone to wake
+  // The last beacon couldn't be started (Bluetooth that can't advertise): phones can't find us.
+  bool BeaconBroken() const { return beaconBroken_; }
+  // Windows refused to advertise over Wi-Fi Direct at all (driver without Wi-Fi Direct).
+  bool Unsupported() { std::lock_guard<std::mutex> lk(mx_); return status_ == kUnsupported; }
+  static constexpr const wchar_t* kUnsupported = L"not supported here";
   void OpenPairWindow();  // also forgets rejected phones: they may be the one being paired
+  void ClosePairWindow();  // a phone just paired, or "Stop pairing"
   void Refresh();         // re-publish now, so a phone searching for us finds us at once
   // The phone on the link isn't paired here: drop it and ignore its requests for 10 minutes.
   void RejectPeer();
   bool Pairing() const { return GetTickCount64() < pairUntil_; }
+  ULONGLONG PairingLeftMs() const { ULONGLONG now = GetTickCount64(); return now < pairUntil_ ? pairUntil_ - now : 0; }
+  static constexpr ULONGLONG kPairWindowMs = 180000;
+  // While pairing, advertising takes turns of this long: the saved way first, then the other one.
+  static constexpr ULONGLONG kPairTurnMs = 30000;
   // A drag is heading for the pill: wake the phone before the drop so the link is ready by then.
   void Prewarm(const std::string& phoneId) {
     std::lock_guard<std::mutex> lk(mx_);
@@ -66,7 +76,9 @@ class WifiDirectHost {
   void Loop();
 
   std::atomic<bool> asGroupOwner_{false};  // how the current advertisement runs
-  bool pairFlip_ = false;                  // while pairing: try the other way next time
+  std::atomic<ULONGLONG> pairFrom_{0};     // when "Pair phone…" was opened; turns count from here
+  uint8_t beaconFlags_ = 0;                // pairing beacon flags sent (bit 0: Wi-Fi off); under mx_
+  std::atomic<bool> beaconBroken_{false};
 
   std::thread thread_;
   std::mutex mx_;

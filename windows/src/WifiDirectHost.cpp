@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "Crypto.h"
+#include "Radios.h"
 #include "Settings.h"
 
 #include <map>
@@ -251,10 +252,19 @@ void WifiDirectHost::Refresh() {
 }
 
 void WifiDirectHost::OpenPairWindow() {
-  pairUntil_ = GetTickCount64() + 180000;
-  Refresh();  // a phone is about to search for us
+  ULONGLONG now = GetTickCount64();
+  pairFrom_ = now;
+  pairUntil_ = now + kPairWindowMs;
+  Refresh();  // a phone is about to search for us: start the first turn now
   std::lock_guard<std::mutex> lk(gPeerMx);
   gRejectedUntil.clear();
+}
+
+void WifiDirectHost::ClosePairWindow() {
+  if (!Pairing()) return;
+  pairUntil_ = 0;
+  Log("wfd: pairing window closed");
+  Refresh();  // back to advertising the saved way (only once no phone is linked)
 }
 
 void WifiDirectHost::RejectPeer() {
@@ -292,18 +302,23 @@ std::string WfdName() {
 // Beacon payloads (manufacturer data, company 0xFFFF):
 //   pending: "WD" + 6-byte tag + 0x01. The tag is HMAC(pairing key, 10-minute window), so only the
 //            paired phone recognises it and it can't be used to follow this PC around.
-//   pairing: "WP" + 0x00 + this PC's Wi-Fi Direct name, only while "Pair phone…" is open,
-//            so a phone that is pairing can find us.
+//   pairing: "WP" + flags + this PC's Wi-Fi Direct name, only while "Pair phone…" is open, so a
+//            phone that is pairing can find us. Flags bit 0: Wi-Fi is off here, so the phone can
+//            say so instead of searching in vain (phones before 0.2.6 ignore the byte).
 void WifiDirectHost::SetBeacon(Beacon mode, const std::string& phoneId) {
   std::lock_guard<std::mutex> lk(mx_);
   int64_t window = BeaconWindow();
-  if (mode == beacon_ && (mode != kBeaconPending || (window == beaconWindow_ && phoneId == beaconPhone_))) return;
-  // Taking turns between pairing and calling the same phone isn't news: no refresh, no log.
-  bool turn = beacon_ != kBeaconOff && mode != kBeaconOff && phoneId == beaconPhone_;
-  bool entering = (mode != beacon_ || phoneId != beaconPhone_) && !turn;
+  uint8_t flags = TheRadios().WifiOn() ? 0 : 1;
+  if (mode == beacon_ && (mode == kBeaconPending ? window == beaconWindow_ && phoneId == beaconPhone_
+                                                 : mode == kBeaconOff || flags == beaconFlags_))
+    return;
+  if (mode == kBeaconPresence && beacon_ == kBeaconPresence && flags != beaconFlags_)
+    Log("ble: pairing beacon now says Wi-Fi is %s", flags ? "off" : "on");
+  bool entering = mode != beacon_ || phoneId != beaconPhone_;
   beacon_ = mode;
   beaconWindow_ = window;
   beaconPhone_ = phoneId;
+  beaconFlags_ = flags;
   try {
     if (gBeacon) { gBeacon.Stop(); gBeacon = nullptr; }
     if (mode == kBeaconOff) { Log("ble: beacon off"); return; }
@@ -313,13 +328,14 @@ void WifiDirectHost::SetBeacon(Beacon mode, const std::string& phoneId) {
       if (key.empty()) { beacon_ = kBeaconOff; return; }
       td::Bytes tag = BeaconTag(key, window);
       data = "WD" + std::string(tag.begin(), tag.end()) + std::string(1, char(1));
-      if (entering) {
-        // The phone is about to search for us: make sure Windows is actively answering probes.
+      if (entering && !asGroupOwner_) {
+        // The phone is about to search for us: make sure Windows is actively answering probes. (A
+        // group owner answers anyway; restarting it would only take its group down.)
         refresh_ = true;
         cv_.notify_all();
       }
     } else {
-      data = "WP" + std::string(1, char(0)) + WfdName();
+      data = "WP" + std::string(1, char(flags)) + WfdName();
     }
     BluetoothLEAdvertisement adv;
     BluetoothLEManufacturerData md;
@@ -328,10 +344,13 @@ void WifiDirectHost::SetBeacon(Beacon mode, const std::string& phoneId) {
     adv.ManufacturerData().Append(md);
     gBeacon = BluetoothLEAdvertisementPublisher(adv);
     gBeacon.Start();
+    beaconBroken_ = false;
     if (entering)
       Log("ble: beacon %s", mode == kBeaconPending ? ("on (wake " + W2U(PhoneLabel(phoneId)) + ")").c_str() : "on (pairing)");
   } catch (winrt::hresult_error const& ex) {
-    Log("ble: beacon failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
+    // Retried on the next tick; say it once, not every second.
+    if (!beaconBroken_.exchange(true))
+      Log("ble: this PC can't broadcast the beacon: 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
     beacon_ = kBeaconOff;
   }
 }
@@ -361,7 +380,21 @@ void WifiDirectHost::Loop() {
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
   int backoff = 2;
   for (;;) {
+    // Wi-Fi off: nothing can answer a phone (a group-owner advertisement is aborted at once, one in
+    // listen mode only seems to start). Wait for it; Radios calls Refresh() when it comes back.
+    if (!TheRadios().WifiOn()) {
+      std::unique_lock<std::mutex> lk(mx_);
+      if (status_ != L"Wi-Fi is off") Log("wfd: Wi-Fi is off; not advertising until it's back");
+      status_ = L"Wi-Fi is off";
+      running_ = false;
+      cv_.wait(lk, [&] { return stop_ || refresh_; });
+      refresh_ = false;
+      if (stop_) break;
+      continue;
+    }
     std::atomic<bool> aborted{false};
+    ULONGLONG turnEnds = 0;  // pairing: when this turn's way of advertising ends
+    bool go = false;         // advertising as group owner (else in listen mode)
     WiFiDirectAdvertisementPublisher pub{nullptr};
     WiFiDirectConnectionListener listener{nullptr};
     try {
@@ -371,17 +404,17 @@ void WifiDirectHost::Loop() {
       // ConnectionRequested below. Some Wi-Fi cards (MediaTek MT7921) never answer searches in
       // listen mode, only while running their own group; the phone then joins that group (by
       // push-button or saved credentials, never an invitation, which Windows ignores), which raises
-      // ConnectionRequested too. Pairing alternates between the two and keeps what worked.
-      bool go;
+      // ConnectionRequested too. While pairing the two take turns on a fixed clock from when
+      // "Pair phone…" was opened (restarts within a turn keep its way), and the way a phone came
+      // in is kept (PhoneFoundUs).
       {
         std::lock_guard<std::recursive_mutex> lk(CfgMutex());
         go = Cfg().wfdGroupOwner;
       }
       if (Pairing()) {
-        if (pairFlip_) go = !go;
-        pairFlip_ = !pairFlip_;
-      } else {
-        pairFlip_ = false;
+        ULONGLONG turn = (GetTickCount64() - pairFrom_) / kPairTurnMs;
+        if (turn % 2) go = !go;
+        turnEnds = pairFrom_ + (turn + 1) * kPairTurnMs;
       }
       asGroupOwner_ = go;
       adv.IsAutonomousGroupOwnerEnabled(go);
@@ -419,7 +452,7 @@ void WifiDirectHost::Loop() {
     } catch (winrt::hresult_error const& ex) {
       Log("wfd: start failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
       std::lock_guard<std::mutex> lk(mx_);
-      status_ = L"not supported here";
+      status_ = kUnsupported;
       aborted = true;
     }
 
@@ -427,22 +460,28 @@ void WifiDirectHost::Loop() {
     bool quit = false, refresh = false;
     {
       std::unique_lock<std::mutex> lk(mx_);
-      // Windows quietly stops answering P2P probes a few minutes after Start(); while no phone is
-      // linked, re-publish periodically so the phone can always find us (more often while pairing,
-      // to try both ways, but not so often that a restart keeps landing in the phone's connect).
+      // When to start over (asked to via Refresh(), or on a timer):
+      // - Wi-Fi went off: always, linked or not (the link went with it); the loop's top waits.
+      // - Pairing: at the end of each turn, to advertise the other way.
+      // - Listen mode: every 90 s, since Windows quietly stops answering P2P probes a few minutes
+      //   after Start(). A group owner keeps beaconing by itself, so it never starts over on a
+      //   timer: a phone joins its group before ConnectionRequested arrives (so gAccepting can't
+      //   cover it) and a restart then would pull the group out from under the phone.
+      // Never while a phone is linked, nor in the middle of a phone's connect (gAccepting).
+      bool renews = turnEnds || !go;
       for (;;) {
-        auto every = std::chrono::seconds(Pairing() ? 30 : 90);
-        if (cv_.wait_for(lk, every, [&] { return stop_ || aborted.load() || refresh_; })) {
-          if (stop_ || aborted) break;
-          if (PeerIp().empty() && gAccepting == 0) { refresh_ = false; refresh = true; break; }
-          if (!PeerIp().empty()) { refresh_ = false; continue; }  // linked: nothing to refresh
-          // Still handling a connection request: refresh once it's done.
-          lk.unlock();
-          Sleep(500);
-          lk.lock();
-          continue;
-        }
-        if (PeerIp().empty() && gAccepting == 0) { refresh = true; break; }
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG ms = turnEnds ? (turnEnds > now ? turnEnds - now : 500) : 90000;
+        bool asked = cv_.wait_for(lk, std::chrono::milliseconds(ms), [&] { return stop_ || aborted.load() || refresh_; });
+        if (stop_ || aborted) break;
+        if (!TheRadios().WifiOn()) { refresh_ = false; refresh = true; break; }
+        if (!asked && !renews) continue;                        // a group owner's timer: nothing to renew
+        if (!PeerIp().empty()) { refresh_ = false; continue; }  // linked: nothing to renew
+        if (gAccepting == 0) { refresh_ = false; refresh = true; break; }
+        // Still handling a connection request: start over once it's done.
+        lk.unlock();
+        Sleep(500);
+        lk.lock();
       }
       quit = stop_;
     }

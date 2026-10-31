@@ -1,5 +1,6 @@
 package com.windrop.app
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,10 +10,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import android.widget.Toast
 import org.json.JSONObject
 import java.io.File
+import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -28,6 +31,7 @@ object Updater {
     private const val ASSET = "WinDrop.apk"
     private const val CH_UPDATES = "updates"
     private const val NOTIF_UPDATE = 40
+    private const val NOTIF_INSTALL = 41
     private const val CHECK_EVERY_MS = 24 * 60 * 60 * 1000L
 
     class Release(val version: String, val url: String, val sha256: String?)
@@ -160,11 +164,18 @@ object Updater {
         }
     }
 
-    /** Hands the APK to the system installer; it asks the user to confirm, then replaces the app. */
+    /** The WinDrop screen while it's in front: the installer's confirmation is started from it. */
+    @Volatile var screen: WeakReference<Activity>? = null
+
+    /**
+     * Hands the APK to the system installer, which replaces the app. Android asks the user to
+     * confirm ([confirm]) unless WinDrop installed itself last time (Android 12+), then it doesn't.
+     */
     fun install(ctx: Context, apk: File) {
         val pi = ctx.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
             setAppPackageName(ctx.packageName)
+            if (Build.VERSION.SDK_INT >= 31) setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
         }
         val id = pi.createSession(params)
         pi.openSession(id).use { s ->
@@ -177,6 +188,32 @@ object Updater {
         }
         Logs.i("update: handed ${apk.name} to the installer")
     }
+
+    /**
+     * Shows Android's "install this update?" screen. Started from the background (the installer's
+     * status broadcast) it is silently dropped on Android 10+ and by some makers' pop-up blocking,
+     * so it's started from the WinDrop screen when that's in front, and a notification always
+     * offers it too in case the screen was left meanwhile.
+     */
+    fun confirm(ctx: Context, confirm: Intent) {
+        confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(CH_UPDATES, "App updates", NotificationManager.IMPORTANCE_DEFAULT))
+        val tap = PendingIntent.getActivity(ctx, NOTIF_INSTALL, confirm, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        nm.notify(NOTIF_INSTALL, Notification.Builder(ctx, CH_UPDATES)
+            .setSmallIcon(R.drawable.ic_windrop_glyph)
+            .setContentTitle("WinDrop update ready")
+            .setContentText("Tap to install it")
+            .setContentIntent(tap)
+            .setAutoCancel(true)
+            .build())
+        val a = screen?.get()
+        if (a != null && !a.isFinishing && !a.isDestroyed) a.runOnUiThread { runCatching { a.startActivity(confirm) } }
+        Logs.i("update: waiting for the user to confirm (${if (a != null) "screen" else "notification"})")
+    }
+
+    /** The installer is done (either way): the "tap to install" notification is stale. */
+    fun finished(ctx: Context) = ctx.getSystemService(NotificationManager::class.java).cancel(NOTIF_INSTALL)
 }
 
 /** Status from the system installer: asks the user to confirm, or reports the outcome. */
@@ -186,13 +223,23 @@ class UpdateResultReceiver : BroadcastReceiver() {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
                 @Suppress("DEPRECATION")
                 val confirm = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT) ?: return
-                ctx.startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                Updater.confirm(ctx, confirm)
             }
-            PackageInstaller.STATUS_SUCCESS -> Logs.i("update: installed")
+            PackageInstaller.STATUS_SUCCESS -> { Updater.finished(ctx); Logs.i("update: installed") }
             else -> {
-                val msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: "status $st"
-                Logs.w("update: install failed: $msg")
-                if (st != PackageInstaller.STATUS_FAILURE_ABORTED) Toast.makeText(ctx, "Update failed: $msg", Toast.LENGTH_LONG).show()
+                Updater.finished(ctx)
+                val raw = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: "status $st"
+                Logs.w("update: install failed ($st): $raw")
+                val msg = when {
+                    // Installed from another build (a self-built or test APK): Android never replaces
+                    // an app with one signed by a different key.
+                    st == PackageInstaller.STATUS_FAILURE_CONFLICT || raw.contains("UPDATE_INCOMPATIBLE") ->
+                        "This WinDrop was installed from a different build, so Android won't update it. " +
+                            "Uninstall WinDrop, install WinDrop.apk from GitHub, then pair again."
+                    st == PackageInstaller.STATUS_FAILURE_STORAGE -> "Update failed: not enough free storage"
+                    else -> "Update failed: $raw"
+                }
+                if (st != PackageInstaller.STATUS_FAILURE_ABORTED) Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
             }
         }
     }

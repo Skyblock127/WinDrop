@@ -16,7 +16,7 @@ AirDrop-style transfers between an Android phone and a Windows PC: files, text, 
 
 1. **PC:** run **WinDrop-Setup.exe**. Wi-Fi and Bluetooth must be on.
 2. **Phone:** install **WinDrop.apk**, open it, and allow what it asks for.
-3. **Pair:** PC tray icon → **Pair phone…**, then **Pair with PC** on the phone. If both screens show the same number, click **Yes** on the PC.
+3. **Pair:** PC tray icon → **Pair phone…** (open for 3 minutes), then **Pair with PC** on the phone. If both screens show the same number, click **Yes** on the PC. Wi-Fi and Bluetooth must be on on both; each side says so if not.
 4. Add the **WinDrop** tile to the phone's Quick Settings (on/off switch).
 
 **"Windows protected your PC"?** WinDrop isn't code-signed yet. Click **More info → Run anyway**. Windows 11's *Smart App Control* blocks unsigned apps outright; the only way past it is turning it off in Windows Security.
@@ -32,6 +32,8 @@ AirDrop-style transfers between an Android phone and a Windows PC: files, text, 
 ## Updates
 
 Both apps check this repo's releases and offer new versions (PC: tray → **Update**; phone: notification and **Update** in the app). Downloads are verified against GitHub's SHA-256 before installing. A phone and PC with incompatible versions refuse to connect and say which one to update.
+
+On the phone, the first update asks to allow **Install unknown apps** for WinDrop. On Android 12+ updates then install without a prompt (Google Play Protect may still offer to scan the app); older versions show Android's install prompt, or a "WinDrop update ready" notification to tap if WinDrop wasn't on screen. If the update says WinDrop *was installed from a different build*, that copy was signed with another key (a self-built APK): uninstall it, install WinDrop.apk from the releases, and pair again.
 
 ## Security
 
@@ -50,6 +52,8 @@ Collect logs on both sides and send them along:
 1. **Clear logs** (PC: tray icon, Logs; phone: WinDrop app, Clear logs).
 2. Try the thing that fails once more.
 3. **Save logs** on both. The files land in `Downloads\WinDrop` (PC) and `Downloads/WinDrop` (phone). They include a check of firewall, antivirus, VPN and radio settings.
+
+WinDrop needs Wi-Fi (every transfer) and Bluetooth (pairing, and the PC calling the phone) switched on on both devices, though the PC doesn't have to be connected to a Wi-Fi network. Both apps say when one is off.
 
 Most pairing failures where the phone says "Couldn't reach your PC" are a firewall or antivirus on the PC. In Windows Security, Firewall & network protection, Public network, "Blocks all incoming connections" must be off. An antivirus with its own firewall needs WinDrop allowed too.
 

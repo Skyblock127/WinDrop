@@ -38,6 +38,8 @@ class MainActivity : Activity() {
     private lateinit var pcName: TextView
     private lateinit var pairBtn: Button
     private lateinit var setupCard: LinearLayout
+    private lateinit var wifiBtn: Button
+    private lateinit var bluetoothBtn: Button
     private lateinit var permBtn: Button
     private lateinit var overlayBtn: Button
     private lateinit var batteryBtn: Button
@@ -153,6 +155,17 @@ class MainActivity : Activity() {
                 return@button
             }
             requestRuntimePermissions()
+            // Pairing finds the PC over Bluetooth and links over Wi-Fi: don't start one that can't work.
+            if (!Radios.bluetoothOn(this)) {
+                Toast.makeText(this, "Turn on Bluetooth to pair: the phone finds the PC over Bluetooth", Toast.LENGTH_LONG).show()
+                Radios.openBluetooth(this)
+                return@button
+            }
+            if (!Radios.wifiOn(this)) {
+                Toast.makeText(this, "Turn on Wi-Fi to pair: the phone connects to the PC over Wi-Fi Direct", Toast.LENGTH_LONG).show()
+                Radios.openWifi(this)
+                return@button
+            }
             if (!prefs.enabled || WinDropService.instance == null) WinDropService.start(this)
             pairingNow = true
             renderPair()
@@ -162,7 +175,11 @@ class MainActivity : Activity() {
         // ---- only when something is missing
         setupCard = card(col)
         setupCard.addView(label("NEEDS YOUR OK", 12f, AMBER, bold = true).apply { letterSpacing = 0.08f })
-        permBtn = button("Notifications, Nearby devices, Bluetooth", setupCard, filled = false) { requestRuntimePermissions() }
+        wifiBtn = button("Turn on Wi-Fi (every transfer goes over it)", setupCard, filled = false) { Radios.openWifi(this) }
+        bluetoothBtn = button("Turn on Bluetooth (to pair, and for the PC to reach you)", setupCard, filled = false) {
+            Radios.openBluetooth(this)
+        }
+        permBtn =button("Notifications, Nearby devices, Bluetooth", setupCard, filled = false) { requestRuntimePermissions() }
         // Android 10 and 11 find no Bluetooth or Wi-Fi Direct devices while Location is off.
         locationBtn = button("Turn on Location (needed to find the PC)", setupCard, filled = false) {
             runCatching { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
@@ -258,12 +275,17 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    // Sent to Android's "Install unknown apps" switch: carry on with the update once it's on.
+    private var installAfterPermission = false
+
     private fun installUpdate() {
         val r = Updater.available ?: return
         if (!Updater.canInstall(this)) {
-            Toast.makeText(this, "Allow WinDrop to install updates, then tap Update again", Toast.LENGTH_LONG).show()
+            installAfterPermission = true
+            Toast.makeText(this, "Allow WinDrop to install updates, then come back", Toast.LENGTH_LONG).show()
             return
         }
+        installAfterPermission = false
         updateState = UpdateState.DOWNLOADING
         updateProgress = 0
         renderUpdate()
@@ -340,6 +362,8 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        Updater.screen = java.lang.ref.WeakReference(this)
+        if (installAfterPermission && packageManager.canRequestPackageInstalls()) installUpdate()
         WinDropService.listeners += refresh
         outbox.listeners += refresh
         // Coming back from the overlay settings: attach the pill now that it's allowed.
@@ -350,6 +374,7 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        if (Updater.screen?.get() === this) Updater.screen = null
         WinDropService.listeners -= refresh
         outbox.listeners -= refresh
         super.onPause()
@@ -436,8 +461,10 @@ class MainActivity : Activity() {
         rendering = true
         master.isChecked = prefs.enabled  // the tile / notification may have flipped it
         rendering = false
+        val radiosOff = Radios.offText(this)
         val (text, color) = when {
             !prefs.enabled -> "Off" to 0xFF6B6D72.toInt()
+            radiosOff != null -> "On · $radiosOff" to AMBER
             !prefs.paired -> "On · not paired" to AMBER
             svc?.p2p?.connectedIp != null -> "Connected to ${prefs.pcLabel}" to GREEN
             else -> "On · ready" to GREEN
@@ -451,16 +478,20 @@ class MainActivity : Activity() {
         }
         renderPair()
 
+        val needWifi = prefs.enabled && !Radios.wifiOn(this)
+        val needBluetooth = prefs.enabled && !Radios.bluetoothOn(this)
         val needPerm = missingPermissions().isNotEmpty()
         val needOverlay = !Settings.canDrawOverlays(this)
         val needBattery = !getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
         val needLocation = Build.VERSION.SDK_INT <= 30 &&
             getSystemService(android.location.LocationManager::class.java)?.isLocationEnabled == false
+        wifiBtn.visibility = if (needWifi) View.VISIBLE else View.GONE
+        bluetoothBtn.visibility = if (needBluetooth) View.VISIBLE else View.GONE
         permBtn.visibility = if (needPerm) View.VISIBLE else View.GONE
         locationBtn.visibility = if (needLocation) View.VISIBLE else View.GONE
         overlayBtn.visibility = if (needOverlay) View.VISIBLE else View.GONE
         batteryBtn.visibility = if (needBattery) View.VISIBLE else View.GONE
-        setupCard.visibility = if (needPerm || needLocation || needOverlay || needBattery) View.VISIBLE else View.GONE
+        setupCard.visibility = if (needWifi || needBluetooth || needPerm || needLocation || needOverlay || needBattery) View.VISIBLE else View.GONE
 
         val items = outbox.list()
         outboxCard.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
