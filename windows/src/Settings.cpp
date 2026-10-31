@@ -73,6 +73,7 @@ void Settings::Load() {
 
   enabled = ReadIni(L"Enabled", L"1") == L"1";
   pillShown = ReadIni(L"ShowPill", L"1") == L"1";
+  wfdGroupOwner = ReadIni(L"WfdGroupOwner", L"0") == L"1";
   phones.clear();
   int count = _wtoi(ReadIni(L"PhoneCount", L"0").c_str());
   for (int i = 0; i < count && phones.size() < kMaxPhones; ++i) {
@@ -106,6 +107,7 @@ void Settings::Save() {
   std::lock_guard<std::recursive_mutex> lk(CfgMutex());
   WriteIni(L"Enabled", enabled ? L"1" : L"0");
   WriteIni(L"ShowPill", pillShown ? L"1" : L"0");
+  WriteIni(L"WfdGroupOwner", wfdGroupOwner ? L"1" : L"0");
   int old = _wtoi(ReadIni(L"PhoneCount", L"0").c_str());
   WriteIni(L"PhoneCount", std::to_wstring(phones.size()));
   for (size_t i = 0; i < std::max<size_t>(phones.size(), (size_t)old); ++i) {

@@ -56,10 +56,15 @@ class WifiDirectHost {
   // almost always means a firewall or antivirus on this PC blocks WinDrop.
   std::function<void()> onUnreachable;
   void SawConnection(const std::string& ip);  // a TCP connection arrived from this address
+  void PhoneFoundUs();  // a phone asked to connect: keep advertising the way it found us
+  bool AsGroupOwner() const { return asGroupOwner_; }
 
 
  private:
   void Loop();
+
+  std::atomic<bool> asGroupOwner_{false};  // how the current advertisement runs
+  bool pairFlip_ = false;                  // while pairing: try the other way next time
 
   std::thread thread_;
   std::mutex mx_;
