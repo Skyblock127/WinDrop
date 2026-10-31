@@ -158,14 +158,20 @@ class MainActivity : Activity() {
             withService { svc ->
                 var sasDialog: android.app.AlertDialog? = null
                 svc.startPairing(onSas = { sas ->
+                    // Pairing outlives this screen (rotation, back, app switch): only show dialogs while it's up.
+                    if (isFinishing || isDestroyed) return@startPairing
                     sasDialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                         .setTitle("Pairing with ${prefs.pcP2pName}")
                         .setMessage("Check that your PC shows the same number:\n\n        ${sas.take(3)} ${sas.drop(3)}\n\nThen click Yes on the PC.")
                         .setCancelable(false)
                         .show()
                 }, onDone = { ok, msg ->
-                    sasDialog?.dismiss()
+                    runCatching { sasDialog?.dismiss() }
                     pairingNow = false
+                    if (isFinishing || isDestroyed) {
+                        Toast.makeText(applicationContext, if (ok) "Paired: $msg" else msg, Toast.LENGTH_LONG).show()
+                        return@startPairing
+                    }
                     render()
                     android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                         .setTitle(if (ok) "Paired" else "Not paired")
