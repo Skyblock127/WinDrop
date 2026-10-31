@@ -91,6 +91,7 @@ class WifiDirectLink(
         onGaveUp()
     }
     private var discoverErrors = 0
+    private var bursts = 0
 
     fun release() {
         // A group can be up without us wanting it (e.g. found on a service restart): tear it down too.
@@ -227,7 +228,9 @@ class WifiDirectLink(
     /**
      * One discovery burst. With the screen off Android's normal find is slow to hear the PC
      * (often 30 s+), so where supported only the three social channels are scanned (where the PC
-     * listens), and the burst is restarted every few seconds.
+     * listens), and the burst is restarted every few seconds. Every other burst is a normal find
+     * over all channels: a PC whose Wi-Fi card only answers while running its own group sits on
+     * that group's channel, often 5 GHz.
      */
     @SuppressLint("MissingPermission")
     private fun discover(ch: WifiP2pManager.Channel) {
@@ -246,7 +249,7 @@ class WifiDirectLink(
             override fun onSuccess() { discoverErrors = 0; main.removeCallbacks(poll); main.postDelayed(poll, 300) }
         }
         val m = mgr ?: return
-        if (Build.VERSION.SDK_INT >= 34 && runCatching { m.isChannelConstrainedDiscoverySupported }.getOrDefault(false)) {
+        if (bursts++ % 2 == 0 && Build.VERSION.SDK_INT >= 34 && runCatching { m.isChannelConstrainedDiscoverySupported }.getOrDefault(false)) {
             m.discoverPeersOnSocialChannels(ch, cb)
         } else {
             m.discoverPeers(ch, cb)

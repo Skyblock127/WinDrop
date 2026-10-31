@@ -76,6 +76,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
   struct Done { ~Done() { gAccepting--; } } done;
   auto info = req.DeviceInformation();
   Log("wfd: connection request from %s (paired=%d)", W2U(std::wstring(info.Name())).c_str(), (int)info.Pairing().IsPaired());
+  TheWifiDirect().PhoneFoundUs();  // whatever happens next, the phone could find us this way
   // One phone at a time: while another is mid-transfer, say no; it retries in a few seconds. An
   // idle link gives way (its phone reconnects when it next needs us).
   if (!TheWifiDirect().PeerIp().empty() && TheWifiDirect().busy > 0) {
@@ -119,7 +120,10 @@ void Accept(WiFiDirectConnectionRequest const& req) {
       auto r = op.GetResults();
       custom.PairingRequested(token);
       Log("wfd: pairing result %d", (int)r.Status());
-      if (r.Status() != DevicePairingResultStatus::Paired && r.Status() != DevicePairingResultStatus::AlreadyPaired) {
+      // A phone that joined our group before keeps its credentials and joins again without the
+      // push-button step, so Windows' pairing fails though the phone is on the group: open it anyway.
+      if (r.Status() != DevicePairingResultStatus::Paired && r.Status() != DevicePairingResultStatus::AlreadyPaired &&
+          !TheWifiDirect().AsGroupOwner()) {
         Unpair(info.Id());  // half-made pairing would block the next attempt
         TheWifiDirect().Refresh();
         return;
@@ -205,6 +209,15 @@ void WifiDirectHost::LinkUp(ULONGLONG since, const std::string& ip) {
       DropPeer();
     }
   }).detach();
+}
+
+void WifiDirectHost::PhoneFoundUs() {
+  bool go = asGroupOwner_;
+  std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+  if (Cfg().wfdGroupOwner == go) return;
+  Cfg().wfdGroupOwner = go;
+  Cfg().Save();
+  Log("wfd: the phone found this PC %s; advertising that way from now on", go ? "as group owner" : "in listen mode");
 }
 
 // Both take mx_ before reading the peer (same order as Status()), so LinkUp can't slip in between.
@@ -354,9 +367,24 @@ void WifiDirectHost::Loop() {
     try {
       pub = WiFiDirectAdvertisementPublisher();
       auto adv = pub.Advertisement();
-      // Not an autonomous GO: the phone's connect then runs normal GO negotiation, which is what
-      // raises ConnectionRequested below (invitations to a standing group are ignored by Windows).
-      adv.IsAutonomousGroupOwnerEnabled(false);
+      // Normally not an autonomous GO: the phone's connect then runs GO negotiation, which raises
+      // ConnectionRequested below. Some Wi-Fi cards (MediaTek MT7921) never answer searches in
+      // listen mode, only while running their own group; the phone then joins that group (by
+      // push-button or saved credentials, never an invitation, which Windows ignores), which raises
+      // ConnectionRequested too. Pairing alternates between the two and keeps what worked.
+      bool go;
+      {
+        std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+        go = Cfg().wfdGroupOwner;
+      }
+      if (Pairing()) {
+        if (pairFlip_) go = !go;
+        pairFlip_ = !pairFlip_;
+      } else {
+        pairFlip_ = false;
+      }
+      asGroupOwner_ = go;
+      adv.IsAutonomousGroupOwnerEnabled(go);
       adv.ListenStateDiscoverability(WiFiDirectAdvertisementListenStateDiscoverability::Intensive);
 
       listener = WiFiDirectConnectionListener();
@@ -387,7 +415,7 @@ void WifiDirectHost::Loop() {
         }
       });
       pub.Start();
-      Log("wfd: publishing");
+      Log("wfd: publishing%s", go ? " as group owner" : "");
     } catch (winrt::hresult_error const& ex) {
       Log("wfd: start failed 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
       std::lock_guard<std::mutex> lk(mx_);
@@ -401,9 +429,9 @@ void WifiDirectHost::Loop() {
       std::unique_lock<std::mutex> lk(mx_);
       // Windows quietly stops answering P2P probes a few minutes after Start(); while no phone is
       // linked, re-publish periodically so the phone can always find us (more often while pairing,
-      // but not so often that a restart keeps landing in the middle of the phone's connect).
+      // to try both ways, but not so often that a restart keeps landing in the phone's connect).
       for (;;) {
-        auto every = std::chrono::seconds(Pairing() ? 60 : 90);
+        auto every = std::chrono::seconds(Pairing() ? 30 : 90);
         if (cv_.wait_for(lk, every, [&] { return stop_ || aborted.load() || refresh_; })) {
           if (stop_ || aborted) break;
           if (PeerIp().empty() && gAccepting == 0) { refresh_ = false; refresh = true; break; }

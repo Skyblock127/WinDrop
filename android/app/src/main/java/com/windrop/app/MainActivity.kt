@@ -394,10 +394,13 @@ class MainActivity : Activity() {
                 .setCancelable(false)
                 .show()
         }, onDone = { ok, msg ->
-            if (isFinishing || isDestroyed) return@startPairing
-            sasDialog?.dismiss()
+            runCatching { sasDialog?.dismiss() }
             sasDialog = null
             pairingNow = false
+            if (isFinishing || isDestroyed) {
+                Toast.makeText(applicationContext, if (ok) "Paired: $msg" else msg, Toast.LENGTH_LONG).show()
+                return@startPairing
+            }
             render()
             android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle(if (ok) "Paired" else "Not paired")

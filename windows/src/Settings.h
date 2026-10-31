@@ -18,6 +18,9 @@ constexpr size_t kMaxPhones = 4;
 struct Settings {
   bool enabled = true;    // master switch (tray "On")
   bool pillShown = true;  // tray "Show pill"
+  // Phones reach this PC over Wi-Fi Direct only while it runs its own group (some Wi-Fi cards never
+  // answer searches in listen mode). Learned while pairing; see WifiDirectHost::PhoneFoundUs.
+  bool wfdGroupOwner = false;
   std::vector<PairedPhone> phones;
   std::string lastPhoneId;  // where Ctrl+Alt+P / Send to go: the phone last sent to or heard from
   std::string deviceId;
