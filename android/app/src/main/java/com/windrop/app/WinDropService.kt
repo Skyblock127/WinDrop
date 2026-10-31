@@ -64,6 +64,8 @@ class WinDropService : Service() {
         // Keep the on-demand link this long after the last transfer, so a quick second item goes
         // straight out instead of paying for a new connection.
         private const val LINK_IDLE_MS = 60_000L
+        // How long pairing looks for a PC with "Pair phone…" open (that stays open 3 minutes).
+        private const val PAIR_FIND_MS = 90_000L
         private const val NOTIF_OFFER = 2
 
         @Volatile var instance: WinDropService? = null
@@ -117,8 +119,13 @@ class WinDropService : Service() {
     /** Permissions granted or pairing code changed. */
     fun onSetupChanged() { ble.start(); ble.reset(); p2p.repair() }
 
-    /** Open the link now (e.g. "Send now" on queued items). */
-    fun connectNow() { if (p2p.connectedIp == null) { p2p.want(); showConnecting() } }
+    /** Open the link now (e.g. "Try again" on queued items). */
+    fun connectNow() {
+        if (p2p.connectedIp != null) return
+        if (!Radios.wifiOn(this)) { wifiWarnedAt = 0; warnWifiOff("Turn it on to send what's waiting"); return }
+        p2p.want()
+        showConnecting()
+    }
 
     /** Close the on-demand link once nothing has moved for a bit, so Android brings Wi-Fi back. */
     private val idleCheck = object : Runnable {
@@ -173,9 +180,38 @@ class WinDropService : Service() {
     private val btState = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             val st = i.getIntExtra(android.bluetooth.BluetoothAdapter.EXTRA_STATE, -1)
-            if (st == android.bluetooth.BluetoothAdapter.STATE_ON) ble.start()
+            if (st == android.bluetooth.BluetoothAdapter.STATE_ON) { Logs.i("bluetooth turned on"); ble.start() }
             else if (st == android.bluetooth.BluetoothAdapter.STATE_OFF) { Logs.w("bluetooth turned off"); ble.stop() }
+            else return
+            updateServiceNotification()
+            notifyListeners()
         }
+    }
+
+    /** Wi-Fi carries every transfer: say when it's off, and send what waited for it once it's back. */
+    private val wifiState = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            if (isInitialStickyBroadcast) return  // the current state, replayed on registering: no change
+            when (i.getIntExtra(android.net.wifi.WifiManager.EXTRA_WIFI_STATE, -1)) {
+                android.net.wifi.WifiManager.WIFI_STATE_ENABLED -> {
+                    Logs.i("wifi turned on")
+                    if (prefs.enabled && prefs.paired && outbox.count > 0) connectNow()
+                }
+                android.net.wifi.WifiManager.WIFI_STATE_DISABLED -> Logs.w("wifi turned off")
+                else -> return
+            }
+            updateServiceNotification()
+            notifyListeners()
+        }
+    }
+    private var wifiWarnedAt = 0L
+
+    /** Says (at most every 2 minutes) that something can't go out because Wi-Fi is off. */
+    private fun warnWifiOff(sub: String) {
+        val now = System.currentTimeMillis()
+        if (now - wifiWarnedAt < 120_000) return
+        wifiWarnedAt = now
+        ui(Island.Msg("Wi-Fi is off", sub, Island.G_WARN, Island.AMBER, onClick = { Radios.openWifi(this) }), 4000, "Wi-Fi is off — $sub")
     }
 
     // ---- lifecycle ----
@@ -213,16 +249,22 @@ class WinDropService : Service() {
             main.post { updateServiceNotification() }
         })
         p2p.start()
-        ble = BleWatcher(this, prefs) { pending, name ->
+        ble = BleWatcher(this, prefs) { pending, name, pcWifiOff ->
             main.post {
                 // A PC in pairing mode: only interesting while we're pairing.
-                if (name.isNotEmpty() && pairing && name != prefs.pcP2pName) {
-                    Logs.i("ble: found PC in pairing mode: $name")
+                if (name.isNotEmpty() && pairing && (name != prefs.pcP2pName || pcWifiOff != pairPcWifiOff)) {
+                    Logs.i("ble: found PC in pairing mode: $name${if (pcWifiOff) " (its Wi-Fi is off)" else ""}")
+                    pairPcWifiOff = pcWifiOff
                     prefs.pcP2pName = name
                     notifyListeners()
                 }
                 if (!pending) return@post
                 if (p2p.connectedIp != null || p2p.wanted || System.currentTimeMillis() < bleCooldownUntil) return@post
+                if (!Radios.wifiOn(this)) {
+                    Logs.w("ble: PC has something for us, but Wi-Fi is off")
+                    warnWifiOff("${prefs.pcLabel} has something for you: turn Wi-Fi on to get it")
+                    return@post
+                }
                 Logs.i("ble: PC has something for us")
                 p2p.want()
                 showConnecting(incoming = true)
@@ -231,6 +273,7 @@ class WinDropService : Service() {
         ble.start()
         registerReceiver(screenOn, IntentFilter(Intent.ACTION_SCREEN_ON))
         registerReceiver(btState, IntentFilter(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED))
+        registerReceiver(wifiState, IntentFilter(android.net.wifi.WifiManager.WIFI_STATE_CHANGED_ACTION))
         if (prefs.enabled) island.attach()
         publishShareShortcut(this)
         Logs.i("service started (WinDrop ${Crypto.appVersion}, ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE})")
@@ -259,6 +302,7 @@ class WinDropService : Service() {
         runCatching { server?.close() }
         runCatching { unregisterReceiver(screenOn) }
         runCatching { unregisterReceiver(btState) }
+        runCatching { unregisterReceiver(wifiState) }
         synchronized(decisions) { decisions.values.forEach { it.first.countDown() } }
         sender.shutdownNow()
         io.shutdownNow()
@@ -328,6 +372,8 @@ class WinDropService : Service() {
         val pc = when {
             !prefs.paired -> "Not paired — open WinDrop to pair"
             linkIp() != null -> "Connected to ${prefs.pcLabel}"
+            !Radios.wifiOn(this) -> "Wi-Fi is off — nothing can be sent or received"
+            !Radios.bluetoothOn(this) -> "Bluetooth is off — ${prefs.pcLabel} can't reach this phone"
             else -> "Ready · ${prefs.pcLabel}"
         }
         val n = outbox.count
@@ -380,8 +426,12 @@ class WinDropService : Service() {
     }
 
     private fun drainPending() {
-        // User asked to send: open the on-demand link (Android may ask to pause Wi-Fi for it).
-        if (pending.isNotEmpty() && p2p.connectedIp == null) { p2p.want(); showConnecting() }
+        // User asked to send: open the on-demand link. With Wi-Fi off there's nothing to open: the
+        // items wait in the outbox and go out by themselves once Wi-Fi is back (see wifiState).
+        if (pending.isNotEmpty() && p2p.connectedIp == null) {
+            if (Radios.wifiOn(this)) { p2p.want(); showConnecting() }
+            else warnWifiOff("Turn it on: this sends by itself then")
+        }
         while (true) {
             val item = pending.poll() ?: break
             queued.incrementAndGet()
@@ -411,10 +461,11 @@ class WinDropService : Service() {
                     val count = outbox.count
                     Logs.i("queued ${item.name} until the link is up ($count waiting)")
                     main.post {
-                        // While the link is coming up the pill already says "Connecting…".
-                        if (!p2p.wanted) {
+                        // While the link is coming up the pill already says "Connecting…"; with Wi-Fi
+                        // off, it already says so.
+                        if (!p2p.wanted && Radios.wifiOn(this)) {
                             if (entry != null && island.attached) island.offline(entry.id, count)
-                            else toast(if (entry != null) "$label not reachable — saved ($count waiting)" else "$label not reachable")
+                            else toast(if (entry != null) "$label not reachable — $count not sent yet" else "$label not reachable")
                         }
                         updateServiceNotification()
                     }
@@ -764,6 +815,7 @@ class WinDropService : Service() {
     // ---- pairing ----
     @Volatile private var pairing = false
     val isPairing: Boolean get() = pairing
+    @Volatile private var pairPcWifiOff = false  // the pairing PC's beacon says its Wi-Fi is off
     // The screen showing the pairing; a reopened screen takes over (main thread only).
     private var pairOnSas: (String) -> Unit = {}
     private var pairOnDone: (Boolean, String) -> Unit = { _, _ -> }
@@ -788,6 +840,7 @@ class WinDropService : Service() {
         val oldAddress = prefs.pcP2pAddress
         prefs.pcP2pName = ""
         prefs.pcP2pAddress = ""
+        pairPcWifiOff = false
         // A link to some PC may be up already; pairing must open a fresh one to the PC in pairing mode.
         val hadLink = p2p.connectedIp != null
         main.post { p2p.release() }
@@ -811,11 +864,16 @@ class WinDropService : Service() {
     }
 
     private fun pairOverLink(hadLink: Boolean): Pair<Boolean, String> {
-        val noPc = "No PC is in pairing mode. On the PC: tray icon \u2192 Pair phone\u2026, then try again."
+        if (!Radios.bluetoothOn(this)) return false to "Bluetooth is off. Turn it on: the phone finds the PC over Bluetooth."
+        if (!Radios.wifiOn(this)) return false to "Wi-Fi is off. Turn it on: the phone connects to the PC over Wi-Fi Direct."
         // 1. Find a PC with pairing open (its Bluetooth beacon carries its name).
-        var deadline = System.currentTimeMillis() + 60_000
+        var deadline = System.currentTimeMillis() + PAIR_FIND_MS
         while (prefs.pcP2pName.isEmpty() && System.currentTimeMillis() < deadline && !stopped) Thread.sleep(200)
-        if (prefs.pcP2pName.isEmpty()) return false to noPc
+        if (prefs.pcP2pName.isEmpty()) {
+            return false to "Didn't find a PC in pairing mode within ${PAIR_FIND_MS / 1000} seconds. On the PC: tray icon \u2192 " +
+                "Pair phone\u2026 (it stays open 3 minutes), keep the PC's Bluetooth on, then tap Pair with PC here."
+        }
+        if (pairPcWifiOff) return false to "Wi-Fi is off on ${prefs.pcP2pName}. Turn it on there, then try again."
         // The old link's group takes a moment to go; asking for the new link before that can
         // mistake the dying group for it.
         if (hadLink) Thread.sleep(1000)
@@ -823,7 +881,11 @@ class WinDropService : Service() {
         main.post { p2p.pairingMode = true; p2p.want(); showConnecting() }
         deadline = System.currentTimeMillis() + 150_000
         while (p2p.connectedIp == null && System.currentTimeMillis() < deadline && !stopped) Thread.sleep(300)
-        if (p2p.connectedIp == null) return false to "Couldn't connect to ${prefs.pcP2pName}. Try turning the phone's Wi-Fi off and on."
+        if (p2p.connectedIp == null) {
+            return false to (if (!Radios.wifiOn(this)) "Wi-Fi went off. Turn it on, then try again."
+            else "Found ${prefs.pcP2pName} over Bluetooth but couldn't connect over Wi-Fi Direct. Keep both close with Wi-Fi " +
+                "on and try again; if it keeps failing, Save logs on both.")
+        }
         // The PC's side of a fresh link can take a moment; keep trying for a while before giving up.
         var conn: PeerResolver.Connection? = null
         val until = System.currentTimeMillis() + 12_000

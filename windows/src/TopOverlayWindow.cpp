@@ -14,6 +14,7 @@ using std::min;
 #include <memory>
 
 #include "DropTarget.h"
+#include "Radios.h"
 #include "Settings.h"
 
 namespace td {
@@ -453,11 +454,25 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
     case NetEv::Offline: {
       outboxBatch_.push_back(e.id);
       Message m;
-      m.title = L"Connecting to " + PhoneLabel(e.phone) + L"\u2026";
-      m.sub = e.count > 1 ? std::to_wstring(e.count) + L" items waiting \u00b7 they send as soon as it connects"
-                          : L"Sends as soon as it connects";
-      m.glyph = kGlyphUp;
-      m.accent = kBlue;
+      std::wstring waiting = e.count > 1 ? std::to_wstring(e.count) + L" items waiting" : L"Waiting";
+      if (!TheRadios().WifiOn()) {
+        // Nothing can connect: say why, so it doesn't look like it's trying.
+        m.title = TheRadios().OffText();
+        m.sub = waiting + L" \u00b7 sends once Wi-Fi is back on";
+        m.glyph = kGlyphWarn;
+        m.accent = kAmber;
+      } else if (!TheRadios().BluetoothOn()) {
+        // The phone can't be called; it still connects when it next sends something.
+        m.title = L"Bluetooth is off";
+        m.sub = waiting + L" \u00b7 turn it on so the phone can be called";
+        m.glyph = kGlyphWarn;
+        m.accent = kAmber;
+      } else {
+        m.title = L"Connecting to " + PhoneLabel(e.phone) + L"\u2026";
+        m.sub = e.count > 1 ? waiting + L" \u00b7 they send as soon as it connects" : L"Sends as soon as it connects";
+        m.glyph = kGlyphUp;
+        m.accent = kBlue;
+      }
       m.buttons.push_back({L"Cancel", kBtnCancelOutbox, kGrayBtn});
       ShowMessage(m, 4000);
       break;
@@ -499,7 +514,8 @@ void TopOverlay::OnButton(int id) {
     size_t n = outboxBatch_.size();
     outboxBatch_.clear();
     Message m;
-    m.title = n > 1 ? L"Removed " + std::to_wstring(n) + L" items from Outbox" : L"Removed from Outbox";
+    m.title = n > 1 ? L"Cancelled " + std::to_wstring(n) + L" items" : L"Cancelled";
+    m.sub = L"Won't be sent";
     m.glyph = kGlyphCancel;
     m.accent = kGrayBtn;
     ShowMessage(m, 1500);

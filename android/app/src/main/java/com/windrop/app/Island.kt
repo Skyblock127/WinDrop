@@ -220,7 +220,7 @@ class Island(private val svc: WinDropService) {
     fun offline(outboxId: Long, count: Int) {
         outboxBatch += outboxId
         showMessage(
-            Msg("${svc.prefs.pcLabel} offline — saved to Outbox ($count)", "Sends automatically when it's back", G_WARN, AMBER,
+            Msg("${svc.prefs.pcLabel} not reachable — $count not sent yet", "Goes out by itself when it's back", G_WARN, AMBER,
                 listOf(Btn(BTN_CANCEL, "Cancel", GRAY_BTN))),
             4000, keepBatch = true,
         )
@@ -241,7 +241,7 @@ class Island(private val svc: WinDropService) {
                 val ids = outboxBatch.toList()
                 outboxBatch.clear()
                 svc.cancelOutbox(ids)
-                showMessage(Msg(if (ids.size > 1) "Removed ${ids.size} items from Outbox" else "Removed from Outbox", glyph = G_X, accent = GRAY_BTN), 1500)
+                showMessage(Msg(if (ids.size > 1) "Cancelled ${ids.size} items" else "Cancelled", "Won't be sent", G_X, GRAY_BTN), 1500)
             }
         }
     }

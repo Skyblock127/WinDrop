@@ -23,6 +23,7 @@ add_executable(WinDrop WIN32
   src/Crypto.cpp
   src/Updater.cpp
   src/Diagnostics.cpp
+  src/Radios.cpp
   res/app.rc
 )
 

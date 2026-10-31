@@ -5,6 +5,7 @@
 #include <functional>
 
 #include "Crypto.h"
+#include "Radios.h"
 #include "Settings.h"
 #include "WifiDirectHost.h"
 
@@ -283,7 +284,10 @@ void NetworkEngine::SenderLoop() {
       e->phone = job.phoneId;
       e->id = TheOutbox().Add(it);
       if (enabled && TheWifiDirect().PeerIp().empty()) {
-        TheWifiDirect().SetBeacon(WifiDirectHost::kBeaconPending, job.phoneId);  // wake it now, not on the next tick
+        // Call it now, not on the next tick, unless the ticker would hold the call back anyway: Wi-Fi
+        // off, or pairing holding the beacon (see TickerLoop).
+        if (TheRadios().WifiOn() && !TheWifiDirect().Pairing())
+          TheWifiDirect().SetBeacon(WifiDirectHost::kBeaconPending, job.phoneId);
         std::lock_guard<std::mutex> lk(tmx_);
         if (waking_.empty()) { waking_ = job.phoneId; wakingSince_ = GetTickCount64(); }
       }
@@ -761,6 +765,8 @@ void NetworkEngine::HandlePair(SOCKET c, const std::string& ip) {
   SendRaw(c, &done, 1);
   Log("pair: paired with %s", name.c_str());
   TheWifiDirect().MarkAuthenticated(id, ip);
+  // Done: phones with something waiting can be called again (pairing has the beacon meanwhile).
+  TheWifiDirect().ClosePairWindow();
   auto* e = new UiEvent{NetEv::PairDone};
   e->name = wname;
   e->count = 1;
@@ -799,14 +805,16 @@ void NetworkEngine::TickerLoop() {
       waking_ = (i + 1 == waiting.end()) ? waiting.front() : *(i + 1);
       wakingSince_ = now;
     }
-    // Pairing open and a phone to call about its queue: take turns every 5 s, so neither the phone
-    // being paired (waiting for the pairing beacon) nor the queue waits out the 3-minute window.
-    bool showPairing = wfd.Pairing() && (waking_.empty() || (now / 5000) % 2 == 0);
-    wfd.SetBeacon(!enabled ? WifiDirectHost::kBeaconOff
-                  : showPairing ? WifiDirectHost::kBeaconPresence
-                  : !waking_.empty() ? WifiDirectHost::kBeaconPending
-                                     : WifiDirectHost::kBeaconOff,
-                  waking_);
+    // While "Pair phone…" is open the pairing beacon has the air to itself, and a phone with
+    // something waiting is called once pairing ends (pairing a phone ends it at once; otherwise
+    // after 3 minutes, or "Stop pairing"). Taking turns every few seconds looked fairer, but in
+    // testing the called phone never caught its turn. With Wi-Fi off here, calling a phone would
+    // only have it search for a link that can't come up.
+    bool call = !waking_.empty() && TheRadios().WifiOn();
+    if (!enabled) wfd.SetBeacon(WifiDirectHost::kBeaconOff);
+    else if (wfd.Pairing()) wfd.SetBeacon(WifiDirectHost::kBeaconPresence);
+    else if (call) wfd.SetBeacon(WifiDirectHost::kBeaconPending, waking_);
+    else wfd.SetBeacon(WifiDirectHost::kBeaconOff);
 
     // A link to a phone with nothing left to do, while another phone waits: hand it over.
     bool othersWait = std::any_of(waiting.begin(), waiting.end(), [&](const std::string& p) { return p != linked; });
