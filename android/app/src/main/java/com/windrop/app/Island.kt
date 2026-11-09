@@ -34,6 +34,8 @@ class Island(private val svc: WinDropService) {
         const val BTN_ACCEPT = 1
         const val BTN_DECLINE = 2
         const val BTN_CANCEL = 3
+        const val BTN_ACCEPT_ALL = 4  // this offer and whatever else that sender sends next
+        const val BTN_DECLINE_ALL = 5
         const val BTN_PICK = 100  // + index of the PC picked in the chooser
 
         const val BLUE = 0xFF2F7CF6.toInt()
@@ -281,7 +283,11 @@ class Island(private val svc: WinDropService) {
     fun onButton(id: Int) {
         when (id) {
             in BTN_PICK until BTN_PICK + 10 -> pick(id - BTN_PICK)
-            BTN_ACCEPT, BTN_DECLINE -> offer?.let { svc.decide(it.id, id == BTN_ACCEPT); offer = null; refresh() }
+            BTN_ACCEPT, BTN_DECLINE, BTN_ACCEPT_ALL, BTN_DECLINE_ALL -> offer?.let {
+                svc.decide(it.id, id == BTN_ACCEPT || id == BTN_ACCEPT_ALL, all = id == BTN_ACCEPT_ALL || id == BTN_DECLINE_ALL)
+                offer = null
+                refresh()
+            }
             BTN_CANCEL -> {
                 val ids = outboxBatch.toList()
                 outboxBatch.clear()
@@ -333,9 +339,13 @@ class Island(private val svc: WinDropService) {
             o != null && !offerHidden && offerExpanded -> {
                 val lines = v.titleLines(o.name, px(wide - 12f - 34f - 10f - 12f))
                 Look(
-                    wide, 16f + 20f * lines + 4f + 18f + 14f + 36f + 14f, 8f, false, o.name, "From ${o.sender} · ${humanSize(o.size)}",
+                    wide, 16f + 20f * lines + 4f + 18f + 14f + 36f + 8f + 36f + 14f, 8f, false, o.name, "From ${o.sender} · ${humanSize(o.size)}",
                     G_DOWN, BLUE, clickable = true, expanded = true,
-                    buttons = listOf(Btn(BTN_DECLINE, "Decline", GRAY_BTN), Btn(BTN_ACCEPT, "Accept", BLUE)),
+                    // "... all" (the rest from this sender too) on its own row above.
+                    buttons = listOf(
+                        Btn(BTN_DECLINE_ALL, "Decline all", GRAY_BTN), Btn(BTN_ACCEPT_ALL, "Accept all", GRAY_BTN),
+                        Btn(BTN_DECLINE, "Decline", GRAY_BTN), Btn(BTN_ACCEPT, "Accept", BLUE),
+                    ),
                 )
             }
             o != null && !offerHidden -> Look(
@@ -523,10 +533,12 @@ class PillView(ctx: Context, private val island: Island) : View(ctx) {
         layout.draw(c)
         c.restore()
         c.drawText(ellipsize(L.sub, sub, tw.toFloat()), tx, top + layout.height + 16 * d, sub)
+        // Rows of two along the bottom, the last pair lowest.
         var right = w - pad
         val bh = 36 * d
-        val by = h - 14 * d - bh
-        for (b in L.buttons.asReversed()) {
+        var by = h - 14 * d - bh
+        for ((n, b) in L.buttons.asReversed().withIndex()) {
+            if (n > 0 && n % 2 == 0) { right = w - pad; by -= bh + 8 * d }
             val bw = btnText.measureText(b.label) + 40 * d
             b.rect.set(right - bw, by, right, by + bh)
             fill.color = if (pressed == b.id) lighten(b.fill) else b.fill; fill.alpha = alpha

@@ -27,7 +27,8 @@ constexpr UINT kPillMs = 4000;  // a pill shows this long, then gets out of the 
 // While a drag is near the top, the window grows into an invisible band this big (DIPs) so a
 // drop anywhere along the top edge counts, not only on the pill itself.
 constexpr float kBandW = 720, kBandH = 130;
-constexpr int kBtnAccept = 1, kBtnDecline = 2, kBtnCancelOutbox = 3, kBtnPick = 100;  // + row
+constexpr int kBtnAccept = 1, kBtnDecline = 2, kBtnCancelOutbox = 3, kBtnAcceptAll = 4, kBtnDeclineAll = 5,
+              kBtnPick = 100;  // + row
 constexpr ULONGLONG kFadeMs = 160;
 
 // Solid, non-purple palette.
@@ -56,6 +57,23 @@ void AddRoundRect(Gdiplus::GraphicsPath& p, float x, float y, float w, float h, 
   p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
   p.AddArc(x, y + h - d, d, d, 90, 90);
   p.CloseFigure();
+}
+
+// Tick and cross drawn as strokes: icon-font glyphs sit off-centre in their em box.
+void DrawMark(Gdiplus::Graphics& g, wchar_t icon, const Gdiplus::RectF& r, float s, float a) {
+  using namespace Gdiplus;
+  Pen pen(Fade(0xFFFFFFFF, a), 2.2f * s);
+  pen.SetStartCap(LineCapRound);
+  pen.SetEndCap(LineCapRound);
+  pen.SetLineJoin(LineJoinRound);
+  float cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2, k = 7 * s;
+  if (icon == kGlyphCheck) {
+    PointF pts[3] = {PointF(cx - k * 0.8f, cy + k * 0.05f), PointF(cx - k * 0.2f, cy + k * 0.62f), PointF(cx + k * 0.85f, cy - k * 0.6f)};
+    g.DrawLines(&pen, pts, 3);
+  } else {
+    g.DrawLine(&pen, cx - k * 0.62f, cy - k * 0.62f, cx + k * 0.62f, cy + k * 0.62f);
+    g.DrawLine(&pen, cx + k * 0.62f, cy - k * 0.62f, cx - k * 0.62f, cy + k * 0.62f);
+  }
 }
 
 struct Fonts {
@@ -545,8 +563,8 @@ void TopOverlay::OnButton(int id) {
     choose_ = {};
     KillTimer(hwnd_, kChooseTimer);
     Deliver(c.ids[i], c.files, c.text);
-  } else if ((id == kBtnAccept || id == kBtnDecline) && offer_.active) {
-    net_->Decide(offer_.id, id == kBtnAccept);
+  } else if ((id == kBtnAccept || id == kBtnDecline || id == kBtnAcceptAll || id == kBtnDeclineAll) && offer_.active) {
+    net_->Decide(offer_.id, id == kBtnAccept || id == kBtnAcceptAll, id == kBtnAcceptAll || id == kBtnDeclineAll);
     offer_.active = false;
     offerExpanded_ = false;
     Refresh();
@@ -621,7 +639,10 @@ void TopOverlay::Refresh() {
       Gdiplus::RectF box;
       g.MeasureString(L.title.c_str(), -1, &f, Gdiplus::RectF(0, 0, L.w - 14 - 36 - 12 - 14, 2000), nullptr, &box);
       L.titleH = std::clamp(box.Height, 20.f, 120.f);
-      L.h = 16 + L.titleH + 4 + 18 + 14 + 32 + 14;
+      // "... all" (the rest from this sender too) on its own row above.
+      L.h = 16 + L.titleH + 4 + 18 + 14 + 32 + 8 + 32 + 14;
+      L.buttons.push_back({L"Decline all", kBtnDeclineAll, kGrayBtn});
+      L.buttons.push_back({L"Accept all", kBtnAcceptAll, kGrayBtn});
       L.buttons.push_back({L"Decline", kBtnDecline, kGrayBtn});
       L.buttons.push_back({L"Accept", kBtnAccept, kBlue});
     } else {
@@ -784,12 +805,16 @@ void TopOverlay::DrawTall(Gdiplus::Graphics& g, int W, int H, float s, float ca,
     }
     return;
   }
-  // Expanded: buttons right-aligned along the bottom.
+  // Expanded: buttons right-aligned in rows of two along the bottom, the last pair lowest.
   float right = W - pad, bh = 32 * s, by = H - 14 * s - bh;
   StringFormat bf;
   bf.SetAlignment(StringAlignmentCenter);
   bf.SetLineAlignment(StringAlignmentCenter);
   for (int i = (int)look_.buttons.size() - 1; i >= 0; --i) {
+    if (i % 2 == 1 && i + 1 < (int)look_.buttons.size()) {  // next row up
+      right = W - pad;
+      by -= bh + 8 * s;
+    }
     auto& b = look_.buttons[i];
     RectF m;
     g.MeasureString(b.label.c_str(), -1, F.btn.get(), PointF(0, 0), &m);
@@ -905,8 +930,7 @@ void TopOverlay::Render() {
         g.FillPath(&fb, &bp);
         SolidBrush tb(Fade(0xFFFFFFFF, ca));
         if (b.icon) {
-          wchar_t gs[2] = {b.icon, 0};
-          g.DrawString(gs, 1, F.icon.get(), r, &bf, &tb);
+          DrawMark(g, b.icon, r, s, ca);
         } else {
           g.DrawString(b.label.c_str(), -1, F.btn.get(), r, &bf, &tb);
         }

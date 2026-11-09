@@ -187,10 +187,11 @@ void NetworkEngine::SendText(const std::string& utf8, std::string phoneId) {
   qcv_.notify_one();
 }
 
-void NetworkEngine::Decide(uint64_t id, bool accept) {
+void NetworkEngine::Decide(uint64_t id, bool accept, bool all) {
   std::lock_guard<std::mutex> lk(omx_);
   if (auto o = offers_.find(id); o != offers_.end()) {
     o->second = accept ? 1 : 0;
+    if (all) offerAll_[id] = true;
     ocv_.notify_all();
     return;
   }
@@ -658,7 +659,7 @@ void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip, cons
   std::wstring wname = SanitizeName(U2W(name));
   if (stranger) {
     // Unpaired: nothing proves who this is, so the user decides.
-    bool yes = AskOffer(type == kTypeText ? L"text" : wname, size, *stranger);
+    bool yes = AskOffer(type == kTypeText ? L"text" : wname, size, *stranger, phoneId);
     uint8_t d = yes ? kAccepted : kDeclined;
     if (!ch.Send(&d, 1) || !ch.Flush() || !yes) {
       Log("offer from %s %s", W2U(*stranger).c_str(), yes ? "broke off" : "declined");
@@ -891,11 +892,22 @@ void NetworkEngine::HandleOpen(SOCKET c, const std::string& ip) {
   lastActivity_ = GetTickCount64();
 }
 
-// The pill asks; false on decline or after a minute.
-bool NetworkEngine::AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from) {
+// The pill asks; false on decline or after a minute. After "accept all" / "decline all", that
+// sender's next offers get the same answer without asking, until it goes quiet for 2 minutes.
+bool NetworkEngine::AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from, const std::string& fromId) {
+  constexpr ULONGLONG kAutoMs = 120000;
   uint64_t id;
   {
     std::lock_guard<std::mutex> lk(omx_);
+    ULONGLONG now = GetTickCount64();
+    if (auto a = autoAnswer_.find(fromId); a != autoAnswer_.end()) {
+      if (now < a->second.until) {
+        a->second.until = now + kAutoMs;
+        Log("nearby: %s %s (all from %s)", W2U(name).c_str(), a->second.yes ? "accepted" : "declined", W2U(from).c_str());
+        return a->second.yes;
+      }
+      autoAnswer_.erase(a);
+    }
     id = ++decisionSeq_;
     offers_[id] = -1;
   }
@@ -911,6 +923,7 @@ bool NetworkEngine::AskOffer(const std::wstring& name, uint64_t size, const std:
     ocv_.wait_for(lk, std::chrono::seconds(60), [&] { return offers_[id] >= 0 || stop_; });
     yes = offers_[id] == 1;
     offers_.erase(id);
+    if (offerAll_.erase(id)) autoAnswer_[fromId] = {yes, GetTickCount64() + kAutoMs};
   }
   auto* closed = new UiEvent{NetEv::OfferClosed};
   closed->id = id;

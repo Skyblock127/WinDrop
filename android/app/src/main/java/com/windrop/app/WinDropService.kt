@@ -70,6 +70,7 @@ class WinDropService : Service() {
         // A link to a nearby (unpaired) PC is let go this soon after its last transfer.
         private const val OPEN_IDLE_MS = 8_000L
         private const val OWN_PC = "\u0000own"  // the chooser's id for our paired PC
+        private const val AUTO_ANSWER_MS = 120_000L
         /** "Let nearby PCs send" lasts this long. */
         const val VISIBLE_MS = 10 * 60_000L
 
@@ -614,11 +615,23 @@ class WinDropService : Service() {
         }
     }
 
-    /** Asks on the pill (or in a notification) whether to take a nearby PC's offer. */
-    private fun askOffer(offer: Proto.Offer, name: String, from: String): Boolean {
+    /**
+     * Asks on the pill (or in a notification) whether to take a nearby PC's offer. After "accept
+     * all" / "decline all", that PC's next offers get the same answer, until it goes quiet for 2 minutes.
+     */
+    private fun askOffer(offer: Proto.Offer, name: String, from: String, fromId: String): Boolean {
+        val now = System.currentTimeMillis()
+        autoAnswer[fromId]?.let { (yes, until) ->
+            if (now < until) {
+                autoAnswer[fromId] = yes to now + AUTO_ANSWER_MS
+                Logs.i("nearby: ${offer.name} from $from ${if (yes) "accepted" else "declined"} (all)")
+                return yes
+            }
+            autoAnswer.remove(fromId)
+        }
         val id = offerSeq.incrementAndGet()
         val latch = CountDownLatch(1)
-        val res = BooleanArray(1)
+        val res = BooleanArray(2)
         synchronized(decisions) { decisions[id] = latch to res }
         val shown = if (offer.type == Proto.TYPE_TEXT) "text" else name
         main.post {
@@ -627,6 +640,7 @@ class WinDropService : Service() {
         }
         val yes = latch.await(60, TimeUnit.SECONDS) && res[0]
         synchronized(decisions) { decisions.remove(id) }
+        if (res[1]) autoAnswer[fromId] = yes to System.currentTimeMillis() + AUTO_ANSWER_MS
         main.post {
             island.closeOffer(id)
             getSystemService(NotificationManager::class.java).cancel(NOTIF_OFFER)
@@ -911,11 +925,11 @@ class WinDropService : Service() {
         if (type != Crypto.HELLO_SESSION || pv.proto != Crypto.PROTO) return
         val ch = SecureChannel.server(c, raw) { id -> if (id == peer.id) peer.key else null } ?: return
         Logs.i("nearby: ${peer.name} connected")
-        serveSession(c, ch, peer.name.ifEmpty { "A PC" })
+        serveSession(c, ch, peer.name.ifEmpty { "A PC" }, peer.id)
     }
 
     /** One offer over an established session. [stranger]: an unpaired PC's name (its offers are asked about). */
-    private fun serveSession(c: Socket, ch: SecureChannel, stranger: String?) {
+    private fun serveSession(c: Socket, ch: SecureChannel, stranger: String?, strangerId: String = "") {
         val inp = DataInputStream(ch.input)
         val out = ch.output
         val offer = Proto.readOffer(inp) ?: return
@@ -938,7 +952,7 @@ class WinDropService : Service() {
         if (stranger == null && offer.sender.isNotEmpty() && offer.sender != prefs.lastPcName) prefs.lastPcName = offer.sender
         Logs.i("offer from ${stranger ?: "the PC"}: ${offer.name} (${humanSize(offer.size)})")
         val name = offer.name.replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1f]"), "_").ifBlank { "file" }
-        if (stranger != null && !askOffer(offer, name, stranger)) { out.write(Proto.DECLINED); out.flush(); return }
+        if (stranger != null && !askOffer(offer, name, stranger, strangerId)) { out.write(Proto.DECLINED); out.flush(); return }
         out.write(Proto.ACCEPTED)  // the paired PC, or the user said yes
         out.flush()
 
@@ -955,11 +969,15 @@ class WinDropService : Service() {
     }
 
 
-    fun decide(id: Long, accept: Boolean) {
+    /** [all]: the same answer for whatever else that sender offers in the next couple of minutes. */
+    fun decide(id: Long, accept: Boolean, all: Boolean = false) {
         synchronized(decisions) {
-            decisions[id]?.let { (latch, res) -> res[0] = accept; latch.countDown() }
+            decisions[id]?.let { (latch, res) -> res[0] = accept; res[1] = all; latch.countDown() }
         }
     }
+
+    // After "accept all" / "decline all": sender id -> (answer, until when).
+    private val autoAnswer = java.util.concurrent.ConcurrentHashMap<String, Pair<Boolean, Long>>()
 
     /** The offer pill was swiped away: keep the request answerable from the notification. */
     fun offerToNotification(id: Long, name: String, size: Long, sender: String) =

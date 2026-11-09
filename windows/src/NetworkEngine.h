@@ -54,7 +54,8 @@ class NetworkEngine {
   // phoneId empty: the default phone (last used).
   void SendFiles(const std::vector<std::wstring>& paths, std::string phoneId = "");
   void SendText(const std::string& utf8, std::string phoneId = "");
-  void Decide(uint64_t id, bool accept);
+  // `all`: the same answer for whatever else that sender offers in the next couple of minutes.
+  void Decide(uint64_t id, bool accept, bool all = false);
   void CancelOutbox(const std::vector<uint64_t>& ids);
   void FlushOutbox(const std::string& phoneId);  // what's waiting for the phone now on the link
   void OnLinkUp();
@@ -86,7 +87,7 @@ class NetworkEngine {
   void HandleSession(SecureChannel& ch, const std::string& ip, const std::string& phoneId,
                      const std::wstring* stranger = nullptr);
   void HandleOpen(SOCKET c, const std::string& ip);  // an unpaired phone wants to send
-  bool AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from);
+  bool AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from, const std::string& fromId);
   SOCKET CallNearby(const std::string& phoneId, std::string* ip);  // brings that phone onto the link
   void UsedPhone(const std::string& phoneId);  // remember it as the default target
   void HandOff(const std::string& phoneId);    // ask the phone on the link to let it go
@@ -115,6 +116,12 @@ class NetworkEngine {
   uint64_t decidedId_ = 0;  // the request decision_ answers
   int decision_ = -1;
   std::map<uint64_t, int> offers_;  // unpaired offers waiting for the user: -1, then 0 / 1
+  std::map<uint64_t, bool> offerAll_;  // answered with "accept all" / "decline all"
+  struct AutoAnswer {
+    bool yes;
+    ULONGLONG until;
+  };
+  std::map<std::string, AutoAnswer> autoAnswer_;  // by sender id, after "... all"
   std::atomic<int> handlers_{0};  // incoming connections being handled
 
   std::mutex tmx_;
