@@ -30,6 +30,7 @@ constexpr uint16_t kBleCompanyId = 0xFFFF;  // "no company" id, reserved for tes
 std::atomic<int> gAccepting{0};
 std::mutex gPeerMx;
 BluetoothLEAdvertisementPublisher gBeacon{nullptr};
+BluetoothLEAdvertisementPublisher gNearbyBeacon{nullptr};  // "WE" visible / "WC" calling a nearby phone
 WiFiDirectDevice gPeer{nullptr};  // the link lives as long as this object does
 std::string gPeerIp;
 std::wstring gPeerName;                          // Wi-Fi Direct name of the phone on the link
@@ -88,14 +89,14 @@ void Accept(WiFiDirectConnectionRequest const& req) {
   {
     std::lock_guard<std::mutex> lk(gPeerMx);
     auto r = gRejectedUntil.find(std::wstring(info.Name()));
-    if (r != gRejectedUntil.end() && GetTickCount64() < r->second && !TheWifiDirect().Pairing()) {
+    if (r != gRejectedUntil.end() && GetTickCount64() < r->second && !TheWifiDirect().OpenToStrangers()) {
       Log("wfd: ignored: %s isn't paired here", W2U(std::wstring(info.Name())).c_str());
       try { req.Close(); } catch (...) {}
       return;
     }
   }
-  if (!HavePairedPhone() && !TheWifiDirect().Pairing()) {
-    Log("wfd: refused: no phone paired and the pairing window is closed");
+  if (!HavePairedPhone() && !TheWifiDirect().OpenToStrangers()) {
+    Log("wfd: refused: no phone paired, and not pairing or visible to nearby phones");
     // Close it rather than leave it hanging: an unanswered request makes Windows sit on this phone's
     // next requests for about 2 minutes, which would stall the pairing the user starts next.
     try { req.Close(); } catch (...) {}
@@ -352,6 +353,34 @@ void WifiDirectHost::SetBeacon(Beacon mode, const std::string& phoneId) {
     if (!beaconBroken_.exchange(true))
       Log("ble: this PC can't broadcast the beacon: 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
     beacon_ = kBeaconOff;
+  }
+}
+
+// Second beacon: "WC" + tag[4] + flags + name calls a nearby phone that has something coming;
+// otherwise "WE" + flags + name while visible. Flags bit 0: this PC's Wi-Fi is off.
+void WifiDirectHost::SetNearbyBeacon(const std::vector<uint8_t>& callTag) {
+  calling_ = callTag.size() == 4;
+  std::string data;
+  std::string flags(1, char(TheRadios().WifiOn() ? 0 : 1));
+  if (calling_) data = "WC" + std::string(callTag.begin(), callTag.end()) + flags + WfdName();
+  else if (Visible()) data = "WE" + flags + WfdName();
+  std::lock_guard<std::mutex> lk(mx_);
+  if (data == nearbyBeacon_) return;
+  nearbyBeacon_ = data;
+  try {
+    if (gNearbyBeacon) { gNearbyBeacon.Stop(); gNearbyBeacon = nullptr; }
+    if (data.empty()) { Log("ble: nearby beacon off"); return; }
+    BluetoothLEAdvertisement adv;
+    BluetoothLEManufacturerData md;
+    md.CompanyId(kBleCompanyId);
+    md.Data(Buf(data));
+    adv.ManufacturerData().Append(md);
+    gNearbyBeacon = BluetoothLEAdvertisementPublisher(adv);
+    gNearbyBeacon.Start();
+    Log("ble: nearby beacon %s", calling_ ? "calling a nearby phone" : "on (visible)");
+  } catch (winrt::hresult_error const& ex) {
+    Log("ble: nearby beacon failed: 0x%08x %s", (unsigned)ex.code(), W2U(std::wstring(ex.message())).c_str());
+    nearbyBeacon_.clear();
   }
 }
 

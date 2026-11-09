@@ -1,4 +1,5 @@
 #include "Settings.h"
+#include "Nearby.h"
 
 #include <shlobj.h>
 
@@ -157,6 +158,7 @@ Bytes KeyFor(const std::string& phoneId) {
 }
 
 std::wstring PhoneLabel(const std::string& phoneId) {
+  if (IsNearbyId(phoneId)) return NearbyName(phoneId);
   std::lock_guard<std::recursive_mutex> lk(CfgMutex());
   auto* p = Cfg().Find(phoneId);
   return p && !p->name.empty() ? p->name : L"your phone";

@@ -34,6 +34,7 @@ class Island(private val svc: WinDropService) {
         const val BTN_ACCEPT = 1
         const val BTN_DECLINE = 2
         const val BTN_CANCEL = 3
+        const val BTN_PICK = 100  // + index of the PC picked in the chooser
 
         const val BLUE = 0xFF2F7CF6.toInt()
         const val GREEN = 0xFF2BB673.toInt()
@@ -61,6 +62,7 @@ class Island(private val svc: WinDropService) {
         val title: String = "", val sub: String = "", val glyph: Int = 0, val accent: Int = BLUE,
         val progress: Boolean = false, val highlight: Boolean = false, val clickable: Boolean = false,
         val buttons: List<Btn> = emptyList(),
+        val stack: Boolean = false,  // buttons as full-width rows under the title (the PC chooser)
     )
 
     class Msg(
@@ -82,6 +84,10 @@ class Island(private val svc: WinDropService) {
     private var xfer: XferUi? = null
     private var msg: Msg? = null
     private val outboxBatch = mutableListOf<Long>()
+    private var chooser: List<String>? = null
+    private var chooserTitle = ""
+    private var onPick: ((Int?) -> Unit)? = null
+    private val chooserTimeout = Runnable { pick(null) }
 
     var look = Look(); private set
     private var cw = 180f
@@ -157,8 +163,9 @@ class Island(private val svc: WinDropService) {
             DragEvent.ACTION_DRAG_EXITED -> { drag = 1; refresh() }
             DragEvent.ACTION_DROP -> {
                 drag = 0
+                val choose = svc.nearbyPcNames().isNotEmpty()  // then the pill asks where to
                 svc.handleDrop(e)
-                showMessage(Msg("Sending to ${svc.prefs.pcLabel}…", "Connecting", G_UP), 1500)
+                if (!choose) showMessage(Msg("Sending to ${svc.prefs.pcLabel}…", "Connecting", G_UP), 1500)
                 return true
             }
             DragEvent.ACTION_DRAG_ENDED -> if (drag != 0) { drag = 0; refresh() }
@@ -167,6 +174,30 @@ class Island(private val svc: WinDropService) {
     }
 
     // ---- events from the service ----
+    /**
+     * "Send to which PC?": one row per target. [pick] gets the index, or null when swiped away or
+     * left for 20 s.
+     */
+    fun showChooser(title: String, targets: List<String>, pick: (Int?) -> Unit) {
+        onPick?.invoke(null)  // an older question is moot now
+        chooser = targets
+        chooserTitle = title
+        onPick = pick
+        main.removeCallbacks(chooserTimeout)
+        main.postDelayed(chooserTimeout, 20_000)
+        view?.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+        refresh()
+    }
+
+    private fun pick(i: Int?) {
+        val cb = onPick ?: return
+        onPick = null
+        chooser = null
+        main.removeCallbacks(chooserTimeout)
+        refresh()
+        cb(i)
+    }
+
     fun showOffer(id: Long, name: String, size: Long, sender: String) {
         offer = OfferUi(id, name, size, sender); offerHidden = false; refresh()
     }
@@ -191,6 +222,7 @@ class Island(private val svc: WinDropService) {
         main.removeCallbacks(expire)
         msg = null
         outboxBatch.clear()
+        if (chooser != null) { pick(null); return }
         if (xfer != null) xferHidden = true
         offer?.let { o ->
             if (!offerHidden) { offerHidden = true; svc.offerToNotification(o.id, o.name, o.size, o.sender) }
@@ -236,6 +268,7 @@ class Island(private val svc: WinDropService) {
 
     fun onButton(id: Int) {
         when (id) {
+            in BTN_PICK until BTN_PICK + 10 -> pick(id - BTN_PICK)
             BTN_ACCEPT, BTN_DECLINE -> offer?.let { svc.decide(it.id, id == BTN_ACCEPT); offer = null; refresh() }
             BTN_CANCEL -> {
                 val ids = outboxBatch.toList()
@@ -262,11 +295,18 @@ class Island(private val svc: WinDropService) {
         val o = offer
         val x = xfer
         val m = msg
+        val choose = chooser
         look = when {
             drag != 0 -> Look(
                 if (drag == 2) 256f else 240f, if (drag == 2) 60f else 56f, 8f, false,
-                if (drag == 2) "Release to send" else "Drop to send to PC", svc.prefs.pcLabel, G_UP, BLUE,
+                if (drag == 2) "Release to send" else "Drop to send to PC",
+                svc.nearbyPcNames().let { n -> if (n.isEmpty()) svc.prefs.pcLabel else if (svc.prefs.paired) "${svc.prefs.pcLabel} or a nearby PC" else "A nearby PC" },
+                G_UP, BLUE,
                 highlight = drag == 2,
+            )
+            choose != null -> Look(
+                wide, 64f + 48f * choose.size, 8f, false, chooserTitle, "Pick one", G_UP, BLUE,
+                buttons = choose.mapIndexed { i, t -> Btn(BTN_PICK + i, t, if (i == 0) BLUE else GRAY_BTN) }, stack = true,
             )
             o != null && !offerHidden -> Look(
                 wide, 72f, 8f, false, "PC sending ${o.name}", "${humanSize(o.size)} · from ${o.sender}", G_DOWN, BLUE,
@@ -354,6 +394,7 @@ class PillView(ctx: Context, private val island: Island) : View(ctx) {
         if (a < 0.05f) return
         val alpha = (a * 255).toInt()
         val pad = 12 * d
+        if (L.stack) { drawStacked(c, L, w, alpha, pad); return }
         val cy = h / 2
 
         // icon bubble
@@ -406,6 +447,32 @@ class PillView(ctx: Context, private val island: Island) : View(ctx) {
             c.drawText(ellipsize(L.sub, sub, tw), tx, cy + 15 * d, sub)
         }
         if (ticking) postInvalidateOnAnimation()
+    }
+
+    /** Icon and title on top, then one full-width row per button. */
+    private fun drawStacked(c: Canvas, L: Island.Look, w: Float, alpha: Int, pad: Float) {
+        val ir = 17 * d
+        val cy = 32 * d
+        fill.color = L.accent; fill.alpha = alpha
+        c.drawCircle(pad + ir, cy, ir, fill)
+        glyph.alpha = alpha
+        drawGlyph(c, L.glyph, pad + ir, cy, 7 * d)
+        val tx = pad + ir * 2 + 10 * d
+        title.alpha = alpha
+        sub.alpha = alpha
+        c.drawText(ellipsize(L.title, title, w - tx - pad), tx, cy - 3 * d, title)
+        c.drawText(ellipsize(L.sub, sub, w - tx - pad), tx, cy + 15 * d, sub)
+        var top = 60 * d
+        val bh = 40 * d
+        for (b in L.buttons) {
+            b.rect.set(pad, top, w - pad, top + bh)
+            fill.color = if (pressed == b.id) lighten(b.fill) else b.fill; fill.alpha = alpha
+            c.drawRoundRect(b.rect, bh / 2, bh / 2, fill)
+            btnText.alpha = alpha
+            c.drawText(ellipsize(b.label, btnText, b.rect.width() - 24 * d), b.rect.centerX(),
+                b.rect.centerY() - (btnText.descent() + btnText.ascent()) / 2, btnText)
+            top += bh + 8 * d
+        }
     }
 
     private fun svc() = WinDropService.instance ?: error("service gone")

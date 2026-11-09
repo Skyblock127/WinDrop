@@ -72,6 +72,12 @@ class WifiDirectLink(
     /** Pairing in progress: connect to the PC found in pairing mode even though we hold no key yet. */
     @Volatile var pairingMode = false
 
+    /**
+     * Unpaired ("nearby") transfer: join the PC with this Wi-Fi Direct name instead of our own.
+     * Cleared by [release].
+     */
+    @Volatile var openTarget: String? = null
+
     fun want() {
         if (!wanted) Logs.i("p2p wanted")
         wanted = true
@@ -87,8 +93,9 @@ class WifiDirectLink(
         // Wi-Fi driver confused for a while.
         if (connecting) { main.postDelayed(giveUp, 15_000); return@Runnable }
         Logs.i("p2p gave up")
+        val nearby = openTarget != null
         release()
-        onGaveUp()
+        if (!nearby) onGaveUp()  // a nearby PC that didn't answer says nothing about our own PC
     }
     private var discoverErrors = 0
     private var bursts = 0
@@ -104,6 +111,7 @@ class WifiDirectLink(
         main.removeCallbacks(poll)
         main.removeCallbacks(rediscover)
         main.removeCallbacks(giveUp)
+        openTarget = null
         channel?.let { ch ->
             runCatching { mgr?.stopPeerDiscovery(ch, null) }
             runCatching { mgr?.cancelConnect(ch, null) }
@@ -213,7 +221,7 @@ class WifiDirectLink(
     private fun tryConnect() {
         val ch = channel ?: return
         if (!running || pcIp != null || !wanted) return
-        if (!prefs.paired && !pairingMode) return  // nothing to connect to yet
+        if (!prefs.paired && !pairingMode && openTarget == null) return  // nothing to connect to yet
         if (!hasPermission()) { Logs.w("no nearby-devices permission"); return }
         searching = true
         connecting = false
@@ -273,6 +281,7 @@ class WifiDirectLink(
     }
 
     private fun isOurPc(d: WifiP2pDevice): Boolean {
+        openTarget?.let { return d.deviceName.startsWith(it, ignoreCase = true) }
         if (d.deviceAddress == prefs.pcP2pAddress && d.deviceAddress.isNotEmpty()) return true
         // The PC's Wi-Fi Direct name comes from its BLE beacon (possibly cut to 17 chars), or from
         // its offers / HELLO. Android doesn't expose the PC's vendor IEs, so a name is all we get.
@@ -306,7 +315,7 @@ class WifiDirectLink(
         main.removeCallbacks(rediscover)
         connecting = true
         Logs.i("p2p found PC ${pc.deviceName} ${pc.deviceAddress}")
-        prefs.pcP2pAddress = pc.deviceAddress
+        if (openTarget == null) prefs.pcP2pAddress = pc.deviceAddress  // a nearby PC isn't ours to remember
         val cfg = temporaryConfig(pc.deviceAddress)
         mgr?.connect(ch, cfg, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {

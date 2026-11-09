@@ -227,6 +227,73 @@ int ReadStatus(SOCKET s, PeerVersion* peer) {
   return st;
 }
 
+namespace {
+
+// pub[65] | idLen | id | nameLen | name
+Bytes OpenPart(const EcdhKey& ec, const std::string& id, const std::string& name) {
+  Bytes m = ec.PublicKey();
+  std::string i = id.substr(0, 255), n = name.substr(0, 255);
+  m.push_back((uint8_t)i.size());
+  m.insert(m.end(), i.begin(), i.end());
+  m.push_back((uint8_t)n.size());
+  m.insert(m.end(), n.begin(), n.end());
+  return m;
+}
+
+bool ReadOpenPart(SOCKET s, Bytes* part, Bytes* pub, OpenPeer* peer) {
+  pub->resize(65);
+  uint8_t len = 0;
+  if (!RecvRaw(s, pub->data(), 65) || !RecvRaw(s, &len, 1)) return false;
+  peer->id.assign(len, '\0');
+  if (len && !RecvRaw(s, peer->id.data(), len)) return false;
+  uint8_t nl = 0;
+  if (!RecvRaw(s, &nl, 1)) return false;
+  peer->name.assign(nl, '\0');
+  if (nl && !RecvRaw(s, peer->name.data(), nl)) return false;
+  *part = *pub;
+  part->push_back(len);
+  part->insert(part->end(), peer->id.begin(), peer->id.end());
+  part->push_back(nl);
+  part->insert(part->end(), peer->name.begin(), peer->name.end());
+  return !peer->id.empty();
+}
+
+bool OpenKey(const EcdhKey& ec, const Bytes& peerPub, const Bytes& client, const Bytes& server, OpenPeer* peer) {
+  Bytes z = ec.Agree(peerPub);
+  if (z.empty()) return false;
+  Bytes label = Str("WDR2 open");
+  peer->key = Hkdf(z, Sha256(Concat({&label, &client, &server})), "WDR2 open key", 32);
+  return true;
+}
+
+}  // namespace
+
+int OpenClient(SOCKET s, const std::string& myId, const std::string& myName, OpenPeer* peer) {
+  EcdhKey ec;
+  Bytes mine = OpenPart(ec, myId, myName);
+  Bytes hello = Envelope(kHelloOpen);
+  hello.insert(hello.end(), mine.begin(), mine.end());
+  if (!SendRaw(s, hello.data(), hello.size())) return -1;
+  PeerVersion pv;
+  int st = ReadStatus(s, &pv);
+  if (st == kStatusRefused) return 0;
+  if (st != kStatusGo) return -1;
+  Bytes theirs, pub;
+  if (!ReadOpenPart(s, &theirs, &pub, peer)) return -1;
+  return OpenKey(ec, pub, mine, theirs, peer) ? 1 : -1;
+}
+
+bool OpenServer(SOCKET s, const std::string& myId, const std::string& myName, OpenPeer* peer) {
+  Bytes theirs, pub;
+  if (!ReadOpenPart(s, &theirs, &pub, peer)) return false;
+  EcdhKey ec;
+  Bytes mine = OpenPart(ec, myId, myName);
+  Bytes reply{kStatusGo};
+  reply.insert(reply.end(), mine.begin(), mine.end());
+  if (!SendRaw(s, reply.data(), reply.size())) return false;
+  return OpenKey(ec, pub, theirs, mine, peer);
+}
+
 SecureChannel::Outcome SecureChannel::ClientHandshake(const Bytes& key, const std::string& myId, PeerVersion* peer) {
   Bytes nc = RandomBytes(16);
   Bytes hello = Envelope(kHelloSession);

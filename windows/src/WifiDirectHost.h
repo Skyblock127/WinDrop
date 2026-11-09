@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace td {
 
@@ -28,7 +29,8 @@ class WifiDirectHost {
   std::string LinkedPhone();  // the paired phone on the link, empty if none (or not proven yet)
   // Transfers in progress over the link; a busy link isn't handed to another phone.
   std::atomic<int> busy{0};
-  // Pairing exchanges in progress; the link isn't dropped while the user checks the number.
+  // Pairing and unpaired ("nearby") exchanges in progress: the link isn't dropped for lacking a
+  // paired phone's proof while one runs (the user may be checking a number or deciding on an offer).
   std::atomic<int> pairExchanges{0};
   static constexpr DWORD kAuthGraceMs = 15000;
   // Bluetooth LE beacon: manufacturer data "TD" + code[0..4] + flag + this PC's Wi-Fi Direct name.
@@ -52,6 +54,18 @@ class WifiDirectHost {
   static constexpr ULONGLONG kPairWindowMs = 180000;
   // While pairing, advertising takes turns of this long: the saved way first, then the other one.
   static constexpr ULONGLONG kPairTurnMs = 30000;
+  // Unpaired ("nearby") phones. Visible: for 10 minutes any phone may send to us (each offer is
+  // accepted or declined on the pill). Calling: we have something for the nearby phone whose
+  // Bluetooth tag this is. Both go out on a second beacon, so pairing and waking keep theirs.
+  void SetVisible(bool on) { visibleUntil_ = on ? GetTickCount64() + kVisibleMs : 0; }
+  bool Visible() const { return GetTickCount64() < visibleUntil_; }
+  ULONGLONG VisibleLeftMs() const { ULONGLONG now = GetTickCount64(); return now < visibleUntil_ ? visibleUntil_ - now : 0; }
+  static constexpr ULONGLONG kVisibleMs = 600000;
+  void SetNearbyBeacon(const std::vector<uint8_t>& callTag);  // ticker: call that phone, else say we're visible, else off
+  bool Calling() const { return calling_; }
+  // A phone we don't have a key for may join now (pairing, visible, or we called it).
+  bool OpenToStrangers() const { return Pairing() || Visible() || calling_; }
+  uint64_t LinkSeq() const { return linkSeq_; }  // changes with every new link
   // A drag is heading for the pill: wake the phone before the drop so the link is ready by then.
   void Prewarm(const std::string& phoneId) {
     std::lock_guard<std::mutex> lk(mx_);
@@ -96,6 +110,9 @@ class WifiDirectHost {
   std::string lastAuthIp_, lastAuthPhone_, lastSawIp_;
   ULONGLONG lastAuthAt_ = 0, lastSawAt_ = 0;
   std::atomic<ULONGLONG> prewarmUntil_{0};
+  std::atomic<ULONGLONG> visibleUntil_{0};
+  std::atomic<bool> calling_{false};
+  std::string nearbyBeacon_;  // payload of the second beacon now on air; under mx_
 };
 
 WifiDirectHost& TheWifiDirect();

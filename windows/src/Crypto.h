@@ -99,6 +99,14 @@ constexpr size_t kRecordMax = 1 << 20;
 inline const char kMagic[5] = "WDRP";
 constexpr uint8_t kProto = 3;
 constexpr uint8_t kHelloSession = 1, kHelloPair = 2;
+// Unpaired ("nearby") transfers: a fresh key from an unauthenticated ECDH exchange, then an
+// ordinary session (envelope kHelloSession) over the same socket with that key. The receiver's
+// user accepts or declines each offer, since nothing proves who the sender is.
+//   C->S envelope(kHelloOpen) | pub[65] | idLen | id | nameLen | name
+//   S->C status | pub[65] | idLen | id | nameLen | name          (status 00: not accepting now)
+//   key = HKDF(ECDH, SHA256("WDR2 open" | C's part | S's part), "WDR2 open key", 32)
+// Older apps don't know kHelloOpen and just close the connection.
+constexpr uint8_t kHelloOpen = 3;
 constexpr uint8_t kStatusRefused = 0, kStatusGo = 1, kStatusIncompatible = 0xFE;
 
 Bytes Envelope(uint8_t type);  // the client's opening bytes for `type`
@@ -107,6 +115,16 @@ bool ReadEnvelope(SOCKET s, uint8_t* type, PeerVersion* peer, bool* compatible);
 void SendIncompatible(SOCKET s);  // our protocol + version, then the caller closes
 // Client: reads the server's status byte (and its version when it's kStatusIncompatible). -1 on error.
 int ReadStatus(SOCKET s, PeerVersion* peer);
+
+// The other side of an open exchange and the key it produced.
+struct OpenPeer {
+  Bytes key;
+  std::string id, name;
+};
+// Client: sends the envelope too. 1 ok, 0 refused (not accepting), -1 error.
+int OpenClient(SOCKET s, const std::string& myId, const std::string& myName, OpenPeer* peer);
+// Server, after ReadEnvelope said kHelloOpen with our protocol.
+bool OpenServer(SOCKET s, const std::string& myId, const std::string& myName, OpenPeer* peer);
 
 template <class F>
 bool SecureChannel::ServerHandshake(F keyFor, std::string* peerId) {

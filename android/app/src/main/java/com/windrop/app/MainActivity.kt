@@ -35,6 +35,8 @@ class MainActivity : Activity() {
     private lateinit var master: Switch
     private lateinit var status: TextView
     private lateinit var statusDot: View
+    private lateinit var visibleBtn: Button
+    private var visibleAfterPermission = false
     private lateinit var pcName: TextView
     private lateinit var pairBtn: Button
     private lateinit var setupCard: LinearLayout
@@ -140,6 +142,7 @@ class MainActivity : Activity() {
         }
         power.addView(master)
         button("Send clipboard to PC", power, filled = false) { startActivity(ClipboardSendActivity.intent(this)) }
+        visibleBtn = button("Let nearby PCs send (10 min)", power, filled = false) { toggleVisible() }
 
         // ---- pairing
         val pair = card(col)
@@ -349,8 +352,27 @@ class MainActivity : Activity() {
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
     }
 
+    /** Lets PCs this phone isn't paired with send to it for 10 minutes (each offer asks first). */
+    private fun toggleVisible() {
+        val svc = WinDropService.instance
+        if (svc == null || !prefs.enabled) { Toast.makeText(this, "Turn WinDrop on first", Toast.LENGTH_SHORT).show(); return }
+        if (svc.visible) { svc.setVisible(false); render(); return }
+        if (!NearbyAdvertiser.hasPermission(this)) {
+            visibleAfterPermission = true
+            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE), 2)
+            return
+        }
+        if (!svc.setVisible(true)) Toast.makeText(this, "Couldn't turn it on. Is Bluetooth on?", Toast.LENGTH_LONG).show()
+        render()
+    }
+
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (visibleAfterPermission) {
+            visibleAfterPermission = false
+            if (NearbyAdvertiser.hasPermission(this)) toggleVisible()
+            else Toast.makeText(this, "Nearby PCs can only find this phone with the Nearby devices permission.", Toast.LENGTH_LONG).show()
+        }
         WinDropService.instance?.onSetupChanged()
         render()
         if (pairAfterPermissions) {
@@ -477,6 +499,9 @@ class MainActivity : Activity() {
             else -> "Waiting for your PC"
         }
         renderPair()
+        val left = (svc?.visibleUntil ?: 0L) - System.currentTimeMillis()
+        visibleBtn.text = if (svc?.visible == true) "Nearby PCs can send · ${(left + 59_999) / 60_000} min left · Stop"
+            else "Let nearby PCs send (10 min)"
 
         val needWifi = prefs.enabled && !Radios.wifiOn(this)
         val needBluetooth = prefs.enabled && !Radios.bluetoothOn(this)

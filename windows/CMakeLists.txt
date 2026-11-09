@@ -24,6 +24,7 @@ add_executable(WinDrop WIN32
   src/Updater.cpp
   src/Diagnostics.cpp
   src/Radios.cpp
+  src/Nearby.cpp
   res/app.rc
 )
 

@@ -47,6 +47,7 @@ object Crypto {
     const val PROTO = 3
     const val HELLO_SESSION = 1
     const val HELLO_PAIR = 2
+    const val HELLO_OPEN = 3  // unpaired ("nearby") transfer; see OpenHello
     const val STATUS_REFUSED = 0
     const val STATUS_GO = 1
     const val STATUS_INCOMPATIBLE = 0xFE
@@ -351,5 +352,58 @@ object Pairing {
         out.flush()
         if (inp.readUnsignedByte() != 0) return null  // PC didn't store it
         return Result(key, String(pcId), String(pcName))
+    }
+}
+
+/**
+ * Unpaired ("nearby") transfers; see windows Crypto.h kHelloOpen. A fresh key from an
+ * unauthenticated ECDH exchange, then an ordinary session over the same socket with that key.
+ * Nothing proves who the other side is, so the receiver's user accepts or declines each offer.
+ */
+object OpenHello {
+    class Peer(val key: ByteArray, val id: String, val name: String)
+
+    private fun part(ec: Crypto.Ecdh, id: String, name: String): ByteArray {
+        val i = id.toByteArray().let { if (it.size > 255) it.copyOf(255) else it }
+        val n = name.toByteArray().let { if (it.size > 255) it.copyOf(255) else it }
+        return ec.publicKey + i.size.toByte() + i + n.size.toByte() + n
+    }
+
+    private class Part(val bytes: ByteArray, val pub: ByteArray, val id: String, val name: String)
+
+    private fun readPart(inp: DataInputStream): Part {
+        val pub = ByteArray(65).also { inp.readFully(it) }
+        val id = ByteArray(inp.readUnsignedByte()).also { inp.readFully(it) }
+        val name = ByteArray(inp.readUnsignedByte()).also { inp.readFully(it) }
+        return Part(pub + id.size.toByte() + id + name.size.toByte() + name, pub, String(id), String(name))
+    }
+
+    private fun key(ec: Crypto.Ecdh, peerPub: ByteArray, client: ByteArray, server: ByteArray): ByteArray? {
+        val z = ec.agree(peerPub) ?: return null
+        return Crypto.hkdf(z, Crypto.sha256("WDR2 open".toByteArray(), client, server), "WDR2 open key", 32)
+    }
+
+    /** Null if the PC isn't taking unpaired phones right now (or the exchange broke). */
+    fun client(s: Socket, myId: String, myName: String): Peer? {
+        val out = s.getOutputStream()
+        val inp = DataInputStream(s.getInputStream())  // unbuffered: the session handshake reads on
+        val ec = Crypto.Ecdh()
+        val mine = part(ec, myId, myName)
+        out.write(Crypto.envelope(Crypto.HELLO_OPEN) + mine)
+        out.flush()
+        if (Crypto.readStatus(inp) != Crypto.STATUS_GO) return null
+        val theirs = readPart(inp)
+        if (theirs.id.isEmpty()) return null
+        return Peer(key(ec, theirs.pub, mine, theirs.bytes) ?: return null, theirs.id, theirs.name)
+    }
+
+    /** Server side, after the caller read an envelope saying HELLO_OPEN with our protocol. */
+    fun server(s: Socket, inp: DataInputStream, myId: String, myName: String): Peer? {
+        val theirs = readPart(inp)
+        if (theirs.id.isEmpty()) return null
+        val ec = Crypto.Ecdh()
+        val mine = part(ec, myId, myName)
+        s.getOutputStream().apply { write(byteArrayOf(Crypto.STATUS_GO.toByte()) + mine); flush() }
+        return Peer(key(ec, theirs.pub, theirs.bytes, mine) ?: return null, theirs.id, theirs.name)
     }
 }

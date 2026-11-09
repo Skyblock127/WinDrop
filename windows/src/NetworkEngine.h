@@ -2,6 +2,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -15,7 +16,7 @@ struct PeerVersion;
 
 enum class NetEv {
   PeerSeen,      // name = phone name
-  Offer,         // (unused since pairing: only the paired phone is accepted)
+  Offer,         // an unpaired phone offers something: id, name, size, path = its name; answer with Decide(id, ...)
   OfferClosed,   // id
   SendStart,     // name, size, count = 1 if it came from the outbox
   SendDone,      // name
@@ -80,7 +81,12 @@ class NetworkEngine {
   bool OpenListener();
   Result SendOne(const Job& job);
   void HandleIncoming(SOCKET c, const std::string& ip);
-  void HandleSession(SecureChannel& ch, const std::string& ip, const std::string& phoneId);
+  // `stranger`: the unpaired sender's name; its offers need the user's OK.
+  void HandleSession(SecureChannel& ch, const std::string& ip, const std::string& phoneId,
+                     const std::wstring* stranger = nullptr);
+  void HandleOpen(SOCKET c, const std::string& ip);  // an unpaired phone wants to send
+  bool AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from);
+  SOCKET CallNearby(const std::string& phoneId, std::string* ip);  // brings that phone onto the link
   void UsedPhone(const std::string& phoneId);  // remember it as the default target
   void HandOff(const std::string& phoneId);    // ask the phone on the link to let it go
   void HandlePair(SOCKET c, const std::string& ip);
@@ -107,6 +113,7 @@ class NetworkEngine {
   uint64_t pendingDecision_ = 0;
   uint64_t decidedId_ = 0;  // the request decision_ answers
   int decision_ = -1;
+  std::map<uint64_t, int> offers_;  // unpaired offers waiting for the user: -1, then 0 / 1
   std::atomic<int> handlers_{0};  // incoming connections being handled
 
   std::mutex tmx_;
@@ -114,6 +121,9 @@ class NetworkEngine {
   int backoffSec_ = 15;
   ULONGLONG nextProbe_ = 0;
   std::string waking_;         // the phone the beacon is calling (one link at a time)
+  std::string calling_;        // nearby (unpaired) phone being called for a send; under tmx_
+  std::string nearbyOnLink_;   // nearby phone on the link, and the link it came on
+  uint64_t nearbyLinkSeq_ = 0;
   ULONGLONG wakingSince_ = 0;
   std::atomic<ULONGLONG> lastActivity_{0};  // end of the last transfer
   std::atomic<bool> handingOff_{false};

@@ -67,6 +67,10 @@ class WinDropService : Service() {
         // How long pairing looks for a PC with "Pair phone…" open (that stays open 3 minutes).
         private const val PAIR_FIND_MS = 90_000L
         private const val NOTIF_OFFER = 2
+        // A link to a nearby (unpaired) PC is let go this soon after its last transfer.
+        private const val OPEN_IDLE_MS = 8_000L
+        /** "Let nearby PCs send" lasts this long. */
+        const val VISIBLE_MS = 10 * 60_000L
 
         @Volatile var instance: WinDropService? = null
             private set
@@ -113,6 +117,13 @@ class WinDropService : Service() {
     lateinit var p2p: WifiDirectLink
     private lateinit var ble: BleWatcher
     @Volatile private var lastActivity = 0L
+    private lateinit var nearbyAdv: NearbyAdvertiser
+    /** Until when nearby (unpaired) PCs may send to us; 0 = not visible. */
+    @Volatile var visibleUntil = 0L; private set
+    val visible get() = System.currentTimeMillis() < visibleUntil
+    private val stopVisible = Runnable { setVisible(false) }
+    // Nearby PCs that let phones send to them ("WE" beacon): name -> last heard (elapsedRealtime).
+    private val nearbyPcs = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val receiving = AtomicInteger(0)
     private var bleCooldownUntil = 0L
 
@@ -131,9 +142,15 @@ class WinDropService : Service() {
     private val idleCheck = object : Runnable {
         override fun run() {
             if (p2p.connectedIp == null) return
-            val idle = System.currentTimeMillis() - lastActivity > LINK_IDLE_MS
+            val open = p2p.openTarget != null
+            val idle = System.currentTimeMillis() - lastActivity > if (open) OPEN_IDLE_MS else LINK_IDLE_MS
+            if (idle && open && queued.get() == 0 && receiving.get() == 0) {
+                Logs.i("nearby: done with ${p2p.openTarget}, letting the link go")
+                p2p.release()
+                return
+            }
             // Pairing waits up to a minute on the PC's user: that link isn't idle.
-            if (idle && !pairing && queued.get() == 0 && receiving.get() == 0 && outbox.count == 0) {
+            if (idle && !open && !pairing && queued.get() == 0 && receiving.get() == 0 && outbox.count == 0) {
                 Logs.i("link idle for ${LINK_IDLE_MS / 1000}s, closing")
                 uploadLogs()
                 sender.execute {
@@ -232,10 +249,17 @@ class WinDropService : Service() {
                 Logs.i(Diagnostics.interfaces().replace('\n', ';'))
                 lastActivity = System.currentTimeMillis()
                 // While pairing, the old key (if any) is about to be replaced: wait for the new one.
-                if (!pairing) { flushOutbox(); uploadLogs() }
+                // A nearby PC isn't ours: nothing of ours goes to it.
+                if (!pairing && p2p.openTarget == null) { flushOutbox(); uploadLogs() }
                 main.removeCallbacks(idleCheck)
                 main.postDelayed(idleCheck, 3000)
                 if (island.attached && island.isConnecting) island.connectingDone()
+            } else if (p2p.openTarget != null) {
+                // The nearby PC closed the link: don't chase it. Our own PC's queue goes next.
+                main.post {
+                    p2p.release()
+                    if (prefs.paired && outbox.count > 0) main.postDelayed({ connectNow() }, 1500)
+                }
             }
             main.post { updateServiceNotification() }
             notifyListeners()
@@ -270,6 +294,8 @@ class WinDropService : Service() {
                 showConnecting(incoming = true)
             }
         }
+        ble.onNearby = { call, name, wifiOff -> main.post { onNearbyBeacon(call, name, wifiOff) } }
+        nearbyAdv = NearbyAdvertiser(this, prefs)
         ble.start()
         registerReceiver(screenOn, IntentFilter(Intent.ACTION_SCREEN_ON))
         registerReceiver(btState, IntentFilter(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED))
@@ -296,6 +322,7 @@ class WinDropService : Service() {
         stopped = true
         instance = null
         island.detach()
+        nearbyAdv.stop()
         ble.stop()
         p2p.stop()
         main.removeCallbacksAndMessages(null)
@@ -425,7 +452,160 @@ class WinDropService : Service() {
         }
     }
 
-    private fun drainPending() {
+    // ---- nearby (unpaired) PCs ----
+    /** Turns "let nearby PCs send to this phone" on (for 10 minutes) or off. False if it can't advertise. */
+    fun setVisible(on: Boolean): Boolean {
+        main.removeCallbacks(stopVisible)
+        if (!on) {
+            if (visibleUntil != 0L) Logs.i("nearby: visibility off")
+            visibleUntil = 0
+            nearbyAdv.stop()
+        } else {
+            if (!nearbyAdv.start(!Radios.wifiOn(this))) return false
+            visibleUntil = System.currentTimeMillis() + VISIBLE_MS
+            main.postDelayed(stopVisible, VISIBLE_MS)
+        }
+        updateServiceNotification()
+        notifyListeners()
+        return true
+    }
+
+    private fun isOwnPc(name: String) = prefs.paired &&
+        (name.equals(prefs.lastPcName, ignoreCase = true) || prefs.pcP2pName.isNotEmpty() && name.startsWith(prefs.pcP2pName, ignoreCase = true))
+
+    /** Nearby PCs that take files from any phone right now (not our own), at most 3. */
+    fun nearbyPcNames(): List<String> {
+        val now = android.os.SystemClock.elapsedRealtime()
+        return nearbyPcs.filter { now - it.value < 12_000 && !isOwnPc(it.key) }.keys.sorted().take(3)
+    }
+
+    /** A nearby PC is visible ([call] null), or calls us because it has something for us. */
+    private fun onNearbyBeacon(call: ByteArray?, name: String, pcWifiOff: Boolean) {
+        if (name.isEmpty()) return
+        if (call == null) {
+            if (nearbyPcs.put(name, android.os.SystemClock.elapsedRealtime()) == null) Logs.i("nearby: $name takes files from nearby phones")
+            return
+        }
+        if (!visible || !call.contentEquals(nearbyAdv.tag)) return
+        if (p2p.openTarget == name && (p2p.connectedIp != null || p2p.wanted)) return  // on our way
+        if (pairing || queued.get() > 0 || receiving.get() > 0) return  // busy: it keeps calling
+        if (!Radios.wifiOn(this)) { warnWifiOff("$name has something for you: turn Wi-Fi on to get it"); return }
+        if (pcWifiOff) Logs.w("nearby: $name calls us but its Wi-Fi is off")
+        Logs.i("nearby: $name has something for us")
+        startOpenLink(name, incoming = true)
+    }
+
+    /** Joins a nearby PC's link (letting go of any other link first). Main thread. */
+    private fun startOpenLink(pc: String, incoming: Boolean) {
+        val hadLink = p2p.connectedIp != null
+        if (hadLink || p2p.wanted) p2p.release()
+        val go = Runnable {
+            p2p.openTarget = pc
+            p2p.want()
+            if (island.attached) island.connecting(pc, incoming)
+            updateServiceNotification()
+        }
+        // The old group takes a moment to go; asking for the new link before that can mistake it.
+        if (hadLink) main.postDelayed(go, 1000) else go.run()
+    }
+
+    /** "Send to which PC?" in the pill, when nearby PCs are around. */
+    private fun chooseTarget(nearby: List<String>) {
+        val items = generateSequence { pending.poll() }.toList()
+        if (items.isEmpty()) return
+        val own = prefs.paired
+        val targets = (if (own) listOf(prefs.pcLabel) else emptyList()) + nearby
+        val what = if (items.size == 1) items[0].name else "${items.size} items"
+        island.showChooser("Send $what to\u2026", targets) { i ->
+            when {
+                i == null -> {
+                    items.forEach { it.close() }
+                    island.showMessage(Island.Msg("Not sent", what, Island.G_X, Island.GRAY_BTN), 1500)
+                }
+                own && i == 0 -> { pending.addAll(items); drainPending(choose = false) }
+                else -> sendNearby(items, targets[i])
+            }
+        }
+    }
+
+    private fun sendNearby(items: List<OutgoingItem>, pc: String) {
+        if (!Radios.wifiOn(this)) {
+            items.forEach { it.close() }
+            warnWifiOff("Turn it on, then send again")
+            return
+        }
+        Logs.i("nearby: sending ${items.size} item(s) to $pc")
+        queued.addAndGet(items.size)
+        startOpenLink(pc, incoming = false)
+        sender.execute {
+            val until = System.currentTimeMillis() + 50_000
+            fun linked() = p2p.openTarget == pc && p2p.connectedIp != null
+            while (!linked() && System.currentTimeMillis() < until && !stopped) Thread.sleep(250)
+            if (!linked()) Logs.w("nearby: couldn't reach $pc")
+            for (item in items) process(item, to = pc)
+        }
+    }
+
+    /** Connects to the nearby PC on the link with a fresh, unpaired key. */
+    private fun openNearbyChannel(): Pair<Socket, SecureChannel>? {
+        var conn: PeerResolver.Connection? = null
+        val until = System.currentTimeMillis() + 10_000
+        while (conn == null && System.currentTimeMillis() < until && p2p.connectedIp != null && !stopped) {
+            conn = PeerResolver.connect(candidates(), 2000)
+            if (conn == null) Thread.sleep(500)
+        }
+        val s = (conn ?: return null).socket
+        tune(s)
+        s.soTimeout = 15_000
+        return try {
+            val peer = OpenHello.client(s, prefs.deviceId, prefs.deviceName)
+            if (peer == null) {
+                Logs.w("nearby: the PC isn't taking files from nearby phones (any more)")
+                runCatching { s.close() }
+                return null
+            }
+            val ch = SecureChannel.client(s, peer.key, prefs.deviceId) ?: run { runCatching { s.close() }; return null }
+            s.soTimeout = 75_000  // the PC's user has a minute to accept
+            Logs.i("nearby: connected to ${peer.name}")
+            s to ch
+        } catch (e: Exception) {
+            Logs.w("nearby: handshake failed", e)
+            runCatching { s.close() }
+            null
+        }
+    }
+
+    /** Asks on the pill (or in a notification) whether to take a nearby PC's offer. */
+    private fun askOffer(offer: Proto.Offer, name: String, from: String): Boolean {
+        val id = offerSeq.incrementAndGet()
+        val latch = CountDownLatch(1)
+        val res = BooleanArray(1)
+        synchronized(decisions) { decisions[id] = latch to res }
+        val shown = if (offer.type == Proto.TYPE_TEXT) "text" else name
+        main.post {
+            if (island.attached) island.showOffer(id, shown, offer.size, from)
+            else showOfferNotification(id, shown, Proto.Offer(offer.type, offer.size, shown, from, ""))
+        }
+        val yes = latch.await(60, TimeUnit.SECONDS) && res[0]
+        synchronized(decisions) { decisions.remove(id) }
+        main.post {
+            island.closeOffer(id)
+            getSystemService(NotificationManager::class.java).cancel(NOTIF_OFFER)
+        }
+        Logs.i("nearby: ${offer.name} from $from ${if (yes) "accepted" else "declined"}")
+        return yes
+    }
+
+    private fun drainPending(choose: Boolean = true) {
+        if (choose && pending.isNotEmpty()) {
+            val nearby = nearbyPcNames()
+            if (nearby.isNotEmpty() && island.attached) { chooseTarget(nearby); return }
+            // Not paired and no pill to ask with: the nearby PC it is.
+            if (!prefs.paired && nearby.isNotEmpty()) {
+                sendNearby(generateSequence { pending.poll() }.toList(), nearby[0])
+                return
+            }
+        }
         // User asked to send: open the on-demand link. With Wi-Fi off there's nothing to open: the
         // items wait in the outbox and go out by themselves once Wi-Fi is back (see wifiState).
         if (pending.isNotEmpty() && p2p.connectedIp == null) {
@@ -442,12 +622,17 @@ class WinDropService : Service() {
 
     private enum class Result { OK, OFFLINE, DECLINED, FAILED }
 
-    private fun process(item: OutgoingItem) {
+    /** [to]: a nearby (unpaired) PC's name; nothing for it goes to the outbox. */
+    private fun process(item: OutgoingItem, to: String? = null) {
         try {
             if (item.outboxId != null && flushAbort) return
-            val r = try { send(item) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
-            Logs.i("send ${item.name} -> $r")
-            val label = prefs.pcLabel
+            var r = try { send(item, to) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
+            Logs.i("send ${item.name}${if (to != null) " to $to" else ""} -> $r")
+            val label = to ?: prefs.pcLabel
+            if (to != null && r == Result.OFFLINE) {
+                ui(Island.Msg("Couldn't reach $to", item.name, Island.G_WARN, Island.AMBER), 3000, "Couldn't reach $to")
+                return
+            }
             when (r) {
                 Result.OK -> {
                     item.outboxId?.let { outbox.remove(it) }
@@ -486,7 +671,9 @@ class WinDropService : Service() {
         }
     }
 
-    private fun send(original: OutgoingItem): Result {
+    private fun send(original: OutgoingItem, to: String? = null): Result {
+        // On a nearby PC's link, our own PC isn't there: keep it for later.
+        if (to == null && p2p.openTarget != null) return Result.OFFLINE
         var item = original
         if (!item.isText && item.size < 0) {
             // Unknown length (some providers stream): spool so we can announce the size.
@@ -495,7 +682,10 @@ class WinDropService : Service() {
             item = item.withSpooled(f)
             f.deleteOnExit()
         }
-        val (s, ch) = try { openChannel() } catch (e: Incompatible) { reportIncompatible(e.peer); return Result.FAILED }
+        val (s, ch) = if (to != null) {
+            if (p2p.openTarget != to || p2p.connectedIp == null) return Result.OFFLINE
+            openNearbyChannel() ?: return Result.FAILED
+        } else try { openChannel() } catch (e: Incompatible) { reportIncompatible(e.peer); return Result.FAILED }
             catch (e: NotPaired) { forgetPairing(); return Result.FAILED }
             ?: return if (prefs.paired) Result.OFFLINE else Result.FAILED
         s.use {
@@ -577,7 +767,7 @@ class WinDropService : Service() {
     fun cancelOutbox(ids: List<Long>) = io.execute { ids.forEach { outbox.remove(it) }; main.post { updateServiceNotification() } }
 
     fun flushOutbox() {
-        if (stopped || flushing || !prefs.paired) return
+        if (stopped || flushing || !prefs.paired || p2p.openTarget != null) return
         if (p2p.connectedIp == null) return
         val entries = outbox.list()
         if (entries.isEmpty()) return
@@ -639,15 +829,37 @@ class WinDropService : Service() {
             reportIncompatible(peer)
             return
         }
+        if (type == Crypto.HELLO_OPEN) { handleOpen(c, raw); return }
         if (type != Crypto.HELLO_SESSION) return
         val ch = SecureChannel.server(c, raw) { id -> if (prefs.paired && id == prefs.pairedPcId) prefs.pairKey else null }
         if (ch == null) {
             Logs.w("refused a connection from ${c.inetAddress.hostAddress}: not the paired PC")
             return
         }
+        serveSession(c, ch, null)
+    }
+
+    /** A nearby (unpaired) PC has something for us: only while we're visible, and the user decides. */
+    private fun handleOpen(c: Socket, raw: DataInputStream) {
+        if (!visible) {
+            Logs.w("nearby: refused a PC: not visible to nearby PCs")
+            c.getOutputStream().apply { write(Crypto.STATUS_REFUSED); flush() }
+            return
+        }
+        val peer = OpenHello.server(c, raw, prefs.deviceId, prefs.deviceName) ?: return
+        val (type, pv) = Crypto.readEnvelope(raw) ?: return
+        if (type != Crypto.HELLO_SESSION || pv.proto != Crypto.PROTO) return
+        val ch = SecureChannel.server(c, raw) { id -> if (id == peer.id) peer.key else null } ?: return
+        Logs.i("nearby: ${peer.name} connected")
+        serveSession(c, ch, peer.name.ifEmpty { "A PC" })
+    }
+
+    /** One offer over an established session. [stranger]: an unpaired PC's name (its offers are asked about). */
+    private fun serveSession(c: Socket, ch: SecureChannel, stranger: String?) {
         val inp = DataInputStream(ch.input)
         val out = ch.output
         val offer = Proto.readOffer(inp) ?: return
+        if (offer.type == Proto.TYPE_RELEASE && stranger != null) { out.write(Proto.BUSY); out.flush(); return }
         if (offer.type == Proto.TYPE_RELEASE) {
             // The PC serves one phone at a time and another one is waiting. Let go unless we're
             // about to send something (this request itself counts as one receive).
@@ -663,10 +875,11 @@ class WinDropService : Service() {
         if (offer.type != Proto.TYPE_FILE && offer.type != Proto.TYPE_TEXT ||
             offer.type == Proto.TYPE_TEXT && offer.size > Proto.MAX_TEXT
         ) { out.write(Proto.BUSY); out.flush(); return }
-        if (offer.sender.isNotEmpty() && offer.sender != prefs.lastPcName) prefs.lastPcName = offer.sender
-        Logs.i("offer from the PC: ${offer.name} (${humanSize(offer.size)})")
+        if (stranger == null && offer.sender.isNotEmpty() && offer.sender != prefs.lastPcName) prefs.lastPcName = offer.sender
+        Logs.i("offer from ${stranger ?: "the PC"}: ${offer.name} (${humanSize(offer.size)})")
         val name = offer.name.replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1f]"), "_").ifBlank { "file" }
-        out.write(Proto.ACCEPTED)  // authenticated as the paired PC: no prompt
+        if (stranger != null && !askOffer(offer, name, stranger)) { out.write(Proto.DECLINED); out.flush(); return }
+        out.write(Proto.ACCEPTED)  // the paired PC, or the user said yes
         out.flush()
 
         c.soTimeout = 30_000

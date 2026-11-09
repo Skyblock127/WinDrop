@@ -23,6 +23,7 @@ using std::min;
 #include "Radios.h"
 #include "Updater.h"
 #include "WifiDirectHost.h"
+#include "Nearby.h"
 
 using namespace td;
 
@@ -47,6 +48,7 @@ enum : UINT {
   IDM_SAVELOGS,
   IDM_CLEARLOGS,
   IDM_PAIR_STOP,
+  IDM_VISIBLE,
   IDM_QUEUE_ITEM = 1000,   // + index into gMenuQueue
   IDM_PHONE_REMOVE = 1100, // + index into gMenuPhones  // + index into gMenuQueue
 };
@@ -333,9 +335,13 @@ void SetOn(bool on) {
   gOverlay.SetEnabled(on);
   if (on) {
     TheWifiDirect().Start();
+    StartNearbyWatch();  // phones that let nearby PCs send to them
   } else {
     TheWifiDirect().SetBeacon(WifiDirectHost::kBeaconOff);
+    TheWifiDirect().SetVisible(false);
+    TheWifiDirect().SetNearbyBeacon({});
     TheWifiDirect().Stop();
+    StopNearbyWatch();
   }
   UpdateTray();
 }
@@ -461,6 +467,11 @@ void ShowMenu() {
   }
   // Pairing holds the Bluetooth beacon, so paired phones aren't called meanwhile: let it be ended.
   if (!pairing.empty()) AppendMenuW(m, MF_STRING, IDM_PAIR_STOP, (L"Stop pairing (" + pairing + L")").c_str());
+  // Unpaired phones may send for 10 minutes (each one asks on the pill first).
+  ULONGLONG visLeft = TheWifiDirect().VisibleLeftMs();
+  std::wstring visLabel = visLeft ? L"Nearby phones can send (" + std::to_wstring((visLeft + 59999) / 60000) + L" min left)"
+                                  : L"Let nearby phones send (10 min)";
+  AppendMenuW(m, MF_STRING | (visLeft ? MF_CHECKED : 0) | (on ? 0 : MF_GRAYED), IDM_VISIBLE, visLabel.c_str());
   AppendMenuW(m, MF_STRING, IDM_OPENDIR, L"Open received folder");
   HMENU logs = CreatePopupMenu();
   AppendMenuW(logs, MF_STRING, IDM_SAVELOGS, L"Save logs to Downloads");
@@ -503,6 +514,13 @@ void OnCommand(UINT id) {
     case IDM_PAIR:
       ShowPairCode();
       break;
+    case IDM_VISIBLE: {
+      bool on = !TheWifiDirect().Visible();
+      TheWifiDirect().SetVisible(on);
+      Log("ui: visible to nearby phones %s", on ? "on" : "off");
+      if (on) gOverlay.Notify(L"Nearby phones can send for 10 minutes", L"On the phone: share or drop onto the pill, pick this PC");
+      break;
+    }
     case IDM_PAIR_STOP:
       KillTimer(gMain, kTimerPairEnd);
       Log("ui: pairing stopped");

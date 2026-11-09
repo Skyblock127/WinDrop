@@ -1,4 +1,5 @@
 #include "TopOverlayWindow.h"
+#include "Nearby.h"
 
 #include "WifiDirectHost.h"
 
@@ -287,8 +288,14 @@ void TopOverlay::PollDrag() {
       monitor_ = mon;
       drag_ = 1;
       spotPhones_.clear();
-      if (auto phones = Phones(); phones.size() > 1)
+      // One spot per paired phone, plus nearby (unpaired) phones that are visible right now.
+      auto phones = Phones();
+      auto nearby = NearbyPhones();
+      if (phones.size() > 1 || !nearby.empty()) {
         for (auto& p : phones) spotPhones_.push_back(p.id);
+        for (auto& n : nearby)
+          if (spotPhones_.size() < 4) spotPhones_.push_back(n.id);
+      }
       hotSpot_ = -1;
       spotRects_.clear();
       TheWifiDirect().Prewarm(DefaultPhone());  // start waking the phone while the user is still dragging
@@ -554,7 +561,7 @@ void TopOverlay::Refresh() {
     L.highlight = drag_ == 2;
     if (!spotPhones_.empty()) {
       size_t n = spotPhones_.size();
-      for (auto& id : spotPhones_) L.spots.push_back(PhoneLabel(id));
+      for (auto& id : spotPhones_) L.spots.push_back(IsNearbyId(id) ? PhoneLabel(id) + L" (nearby)" : PhoneLabel(id));
       L.w = n * (n > 2 ? kSpotW4 : kSpotW) + (n - 1) * kSpotGap;
       L.h = 64;
       L.hot = hotSpot_;

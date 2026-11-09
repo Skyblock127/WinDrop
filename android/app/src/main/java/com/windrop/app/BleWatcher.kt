@@ -32,10 +32,30 @@ class BleWatcher(
     // window); only we can check it, and it changes, so the beacon can't be used to track the PC.
     // "WP" + flags + name: a PC in its pairing window; tells a pairing phone its name. Flags bit 0:
     // the PC's Wi-Fi is off (PCs before 0.2.6 always send 0).
+    /**
+     * Unpaired ("nearby") PCs: "WE" + flags + name, a PC letting nearby phones send to it; "WC" +
+     * tag[4] + flags + name, a PC calling the nearby phone with that tag (see Nearby.kt). Called
+     * on the scan thread, at most every couple of seconds per PC.
+     */
+    @Volatile var onNearby: (call: ByteArray?, pcName: String, pcWifiOff: Boolean) -> Unit = { _, _, _ -> }
+    private val nearbySeen = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun dispatchNearby(d: ByteArray, call: Boolean) {
+        val at = if (call) 7 else 3
+        if (d.size <= at) return
+        val name = String(d, at, d.size - at, Charsets.UTF_8).trim { it <= ' ' }
+        val now = android.os.SystemClock.elapsedRealtime()
+        val key = (if (call) "C" else "E") + name
+        if (now - (nearbySeen[key] ?: 0L) < 2_000) return
+        nearbySeen[key] = now
+        onNearby(if (call) d.copyOfRange(2, 6) else null, name, d[at - 1].toInt() and 1 != 0)
+    }
+
     private fun dispatch(r: ScanResult) {
         val d = r.scanRecord?.getManufacturerSpecificData(Proto.BLE_COMPANY_ID) ?: return
         if (d.size < 3) return
         val kind = String(d, 0, 2, Charsets.US_ASCII)
+        if (kind == "WE" || kind == "WC") { dispatchNearby(d, kind == "WC"); return }
         var name = ""
         var wifiOff = false
         var pending = false
@@ -95,7 +115,7 @@ class BleWatcher(
         fun prefix(p: String) = p.toByteArray().let { data ->
             ScanFilter.Builder().setManufacturerData(Proto.BLE_COMPANY_ID, data, ByteArray(data.size) { -1 }).build()
         }
-        val filters = listOf(prefix("WD"), prefix("WP"))
+        val filters = listOf(prefix("WD"), prefix("WP"), prefix("WE"), prefix("WC"))
         val settings = ScanSettings.Builder()
             // Balanced: notices the PC within ~1-2 s instead of ~5 s, still a filtered hardware scan.
             .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
