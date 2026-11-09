@@ -382,7 +382,7 @@ void TopOverlay::UpdateChooser() {
     bool none = choose_.ids.empty();
     choose_ = {};
     KillTimer(hwnd_, kChooseTimer);
-    if (none) Notify(L"No phone found nearby", L"Pair one (tray → Pair phone…), or on the phone: Let nearby PCs send", true);
+    if (none) Notify(L"No phone found nearby", L"Pair one in the WinDrop window, or on the phone: Let nearby PCs send", true);
     else Notify(L"Not sent", L"No phone was picked");
     return;
   }

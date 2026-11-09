@@ -24,6 +24,7 @@ using std::min;
 #include "Updater.h"
 #include "WifiDirectHost.h"
 #include "Nearby.h"
+#include "AppWindow.h"
 
 using namespace td;
 
@@ -49,8 +50,7 @@ enum : UINT {
   IDM_CLEARLOGS,
   IDM_PAIR_STOP,
   IDM_VISIBLE,
-  IDM_QUEUE_ITEM = 1000,   // + index into gMenuQueue
-  IDM_PHONE_REMOVE = 1100, // + index into gMenuPhones  // + index into gMenuQueue
+  IDM_OPEN,  // the WinDrop window
 };
 
 constexpr UINT WM_APP_UPDATE = WM_APP + 40;         // wParam: 1 = asked by the user; lParam: UpdateInfo* (null = check failed)
@@ -151,7 +151,7 @@ void SetStartup(bool on) {
   if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
   RegDeleteValueW(k, L"TopDrop");  // from before the rename
   if (on) {
-    std::wstring v = L"\"" + ExePath() + L"\"";
+    std::wstring v = L"\"" + ExePath() + L"\" --tray";
     RegSetValueExW(k, kRunValue, 0, REG_SZ, (const BYTE*)v.c_str(), DWORD((v.size() + 1) * sizeof(wchar_t)));
   } else {
     RegDeleteValueW(k, kRunValue);
@@ -176,10 +176,7 @@ void RefreshStartupPath() {
   if (StartupEnabled()) SetStartup(true);
 }
 
-// ---- queued (not yet sent) items, shown in the tray menu ----
-std::vector<OutboxItem> gMenuQueue;  // what the open menu listed, by index
-std::vector<PairedPhone> gMenuPhones;
-
+// ---- queued (not yet sent) items, listed in the window ----
 std::wstring QueueLabel(const OutboxItem& it) {
   std::wstring s;
   if (it.isText) {
@@ -189,50 +186,8 @@ std::wstring QueueLabel(const OutboxItem& it) {
   } else {
     s = FileNameOf(it.path);
   }
-  if (s.size() > 48) s = s.substr(0, 47) + L"…";
-  std::wstring out;  // a lone & would underline the next letter
-  for (auto c : s) {
-    out += c;
-    if (c == L'&') out += L'&';
-  }
-  return out;
-}
-
-HMENU QueueMenu(size_t* count) {
-  gMenuQueue = TheOutbox().Snapshot();
-  *count = gMenuQueue.size();
-  HMENU q = CreatePopupMenu();
-  if (gMenuQueue.empty()) {
-    AppendMenuW(q, MF_STRING | MF_GRAYED, 0, L"Nothing waiting");
-    return q;
-  }
-  AppendMenuW(q, MF_STRING | MF_GRAYED, 0, L"Sent when the phone is in reach · click one to cancel it");
-  // Grouped by phone (in pairing order), each under its own heading with its own count.
-  auto phones = Phones();
-  auto rank = [&](const std::string& id) {
-    for (size_t i = 0; i < phones.size(); ++i)
-      if (phones[i].id == id) return i;
-    return phones.size();
-  };
-  std::stable_sort(gMenuQueue.begin(), gMenuQueue.end(),
-                   [&](const OutboxItem& a, const OutboxItem& b) { return rank(a.phoneId) < rank(b.phoneId); });
-  size_t shown = std::min<size_t>(gMenuQueue.size(), 30);
-  for (size_t i = 0; i < shown; ++i) {
-    const auto& it = gMenuQueue[i];
-    if (i == 0 || it.phoneId != gMenuQueue[i - 1].phoneId) {
-      AppendMenuW(q, MF_SEPARATOR, 0, nullptr);
-      if (phones.size() > 1) {
-        size_t n = std::count_if(gMenuQueue.begin(), gMenuQueue.end(), [&](const OutboxItem& o) { return o.phoneId == it.phoneId; });
-        AppendMenuW(q, MF_STRING | MF_GRAYED, 0, (L"For " + PhoneLabel(it.phoneId) + L" (" + std::to_wstring(n) + L")").c_str());
-      }
-    }
-    AppendMenuW(q, MF_STRING, IDM_QUEUE_ITEM + UINT(i), QueueLabel(it).c_str());
-  }
-  if (gMenuQueue.size() > shown)
-    AppendMenuW(q, MF_STRING | MF_GRAYED, 0, (L"…and " + std::to_wstring(gMenuQueue.size() - shown) + L" more").c_str());
-  AppendMenuW(q, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(q, MF_STRING, IDM_QUEUE_CLEAR, L"Cancel all");
-  return q;
+  if (s.size() > 80) s = s.substr(0, 79) + L"\u2026";
+  return s;
 }
 
 void SetClipboardText(const std::wstring& t) {
@@ -302,6 +257,7 @@ void UpdateTray() {
   std::wstring off = TheRadios().OffText();
   std::wstring tip = !on ? L"WinDrop — off" : L"WinDrop — " + PhonesLine() + (off.empty() ? L"" : L" · " + off);
   wcsncpy_s(gNid.szTip, tip.c_str(), _TRUNCATE);
+  TheApp().Refresh();
   gNid.hIcon = on ? gIconOn : gIconOff;
   gNid.uFlags = NIF_TIP | NIF_ICON | NIF_SHOWTIP;  // v4 icons show no tooltip without NIF_SHOWTIP
   Shell_NotifyIconW(NIM_MODIFY, &gNid);
@@ -372,20 +328,23 @@ std::wstring PairingLeft() {
   return left > 60000 ? std::to_wstring((left + 59999) / 60000) + L" min left" : std::to_wstring((left + 999) / 1000) + L" s left";
 }
 
-// The "Pair with ...?" prompt (a MessageBoxW on the UI thread).
-constexpr wchar_t kPairPromptTitle[] = L"WinDrop \u2014 Pair phone";
-bool gPairPromptOpen = false;
-uint64_t gPairPromptId = 0;
-std::unique_ptr<UiEvent> gNextPairRequest;  // arrived while a prompt was open
+// A phone asking to pair: the window shows its number until it's answered or the request ends.
+struct PairAsk {
+  uint64_t id = 0;
+  std::wstring name, sas;
+} gPairAsk;
 
-void ClosePairPrompt() {
-  // Only one prompt is ever open, so the title finds it. EndDialog returns IDNO from MessageBoxW.
-  if (HWND box = FindWindowW(L"#32770", kPairPromptTitle)) EndDialog(box, IDNO);
+void AnswerPair(uint64_t id, bool yes) {
+  gNet.Decide(id, yes);  // ignored if that request is already over
+  if (gPairAsk.id == id) gPairAsk = {};
+  TheApp().SetAlwaysOnTop(false);
 }
 
 // ---- updates ----
 UpdateInfo gUpdate;            // newest release found; version empty if none
 std::atomic<bool> gUpdateBusy{false};
+std::atomic<bool> gInstalling{false};
+std::wstring gUpdateNote;      // the last check's result, for the window: "up to date"
 std::string gUpdateAnnounced;  // version the pill already announced
 
 void StartUpdateCheck(bool manual) {
@@ -400,87 +359,137 @@ void StartUpdateCheck(bool manual) {
 
 void InstallNow() {
   if (gUpdate.version.empty() || gUpdateBusy.exchange(true)) return;
+  gInstalling = true;
   gOverlay.Notify(L"Downloading WinDrop " + U2W(gUpdate.version) + L"…", L"It restarts by itself when it's done");
   UpdateInfo info = gUpdate;
   std::thread([info] {
     std::wstring err;
     bool ok = InstallUpdate(info, [](int) {}, &err);
+    gInstalling = false;
     gUpdateBusy = false;
     if (ok) PostMessageW(gMain, WM_CLOSE, 0, 0);  // the installer replaces and restarts us
     else PostMessageW(gMain, WM_APP_UPDATE_FAILED, 0, (LPARAM) new std::wstring(err));
   }).detach();
 }
 
-void AskToUpdate() {
-  std::wstring msg = L"WinDrop " + U2W(gUpdate.version) + L" is available (you have " + U2W(WINDROP_VERSION) +
-                     L").\n\nUpdate now? WinDrop restarts by itself; Windows asks for permission once.";
-  if (MessageBoxW(gMain, msg.c_str(), L"WinDrop update", MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES)
-    InstallNow();
-}
-
 void OnUpdateChecked(bool manual, UpdateInfo* found) {
   std::unique_ptr<UpdateInfo> info(found);
   if (!info) {
-    if (manual) gOverlay.Notify(L"Couldn't check for updates", L"Check the internet connection and try again", true);
+    if (manual) gUpdateNote = L"couldn't check (offline?)";
+    TheApp().Refresh();
     return;
   }
   if (info->version.empty()) {
-    if (manual) gOverlay.Notify(L"WinDrop is up to date", L"Version " + U2W(WINDROP_VERSION));
+    gUpdateNote = L"up to date";
+    TheApp().Refresh();
     return;
   }
   gUpdate = *info;
   if (manual) {
-    AskToUpdate();
+    TheApp().Show();  // its "Update to ..." button is the question
   } else if (gUpdateAnnounced != gUpdate.version) {
     gUpdateAnnounced = gUpdate.version;
-    gOverlay.Notify(L"WinDrop " + U2W(gUpdate.version) + L" is available", L"Tray icon → Update");
+    gOverlay.Notify(L"WinDrop " + U2W(gUpdate.version) + L" is available", L"Tray icon \u2192 Settings \u2192 Update");
   }
+  TheApp().Refresh();
 }
 
+// Everything the window shows, read fresh on each refresh.
+AppView BuildView() {
+  AppView v;
+  v.on = Cfg().enabled;
+  v.pillShown = Cfg().pillShown;
+  v.startup = StartupEnabled();
+  auto phones = Phones();
+  std::string linked = TheWifiDirect().LinkedPhone();
+  std::wstring off = TheRadios().OffText();
+  if (!v.on) {
+    v.status = L"Off";
+    v.statusColor = 0xFF6B6D72;
+  } else if (!off.empty()) {
+    v.status = L"On \u00b7 " + off;
+    v.statusColor = 0xFFF5A524;
+  } else if (!linked.empty()) {
+    v.status = L"Connected to " + PhoneLabel(linked);
+    v.statusColor = 0xFF2BB673;
+  } else if (phones.empty()) {
+    v.status = L"On \u00b7 no phone paired";
+    v.statusColor = 0xFFF5A524;
+  } else {
+    v.status = L"On \u00b7 ready";
+    v.statusColor = 0xFF2BB673;
+  }
+  if (v.on && !TheRadios().WifiOn())
+    v.warning = off + L": WinDrop can't send or receive until Wi-Fi is back on.";
+  else if (v.on && !off.empty())
+    v.warning = L"Bluetooth is off: pairing and sending to your phone need it. The phone can still send here.";
+  else if (v.on && TheWifiDirect().Unsupported())
+    v.warning = L"This PC's Wi-Fi can't do Wi-Fi Direct, which WinDrop needs. A Wi-Fi driver update may fix it.";
+  v.visibleLeftMs = TheWifiDirect().VisibleLeftMs();
+  v.visibleTotalMs = WifiDirectHost::kVisibleMs;
+  v.pairingLeftMs = TheWifiDirect().PairingLeftMs();
+  v.pairingTotalMs = WifiDirectHost::kPairWindowMs;
+
+  auto queue = TheOutbox().Snapshot();
+  for (auto& p : phones) {
+    AppView::Phone ph;
+    ph.id = p.id;
+    ph.name = p.name.empty() ? L"Phone" : p.name;
+    ph.linked = p.id == linked;
+    size_t n = std::count_if(queue.begin(), queue.end(), [&](const OutboxItem& o) { return o.phoneId == p.id; });
+    ph.sub = ph.linked ? L"Connected" : L"Paired";
+    if (n) ph.sub += L" \u00b7 " + std::to_wstring(n) + L" waiting";
+    v.phones.push_back(ph);
+  }
+  v.maxPhones = kMaxPhones;
+  // Grouped by phone, in pairing order.
+  auto rank = [&](const std::string& id) {
+    for (size_t i = 0; i < phones.size(); ++i)
+      if (phones[i].id == id) return i;
+    return phones.size();
+  };
+  std::stable_sort(queue.begin(), queue.end(), [&](const OutboxItem& a, const OutboxItem& b) { return rank(a.phoneId) < rank(b.phoneId); });
+  for (auto& it : queue) {
+    AppView::Item item;
+    item.id = it.id;
+    item.label = QueueLabel(it);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (it.isText) item.sub = L"Text";
+    else if (GetFileAttributesExW(it.path.c_str(), GetFileExInfoStandard, &fa))
+      item.sub = HumanSize((uint64_t(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow);
+    else item.sub = L"File";
+    if (phones.size() > 1) item.sub += L" \u00b7 for " + PhoneLabel(it.phoneId);
+    v.queue.push_back(item);
+  }
+
+  std::wstring ver = U2W(WINDROP_VERSION);
+  v.updateReady = !gUpdate.version.empty();
+  v.updateBusy = gUpdateBusy;
+  v.version = L"Version " + ver + (v.updateReady ? L" \u00b7 " + U2W(gUpdate.version) + L" is out"
+                                                 : gUpdateNote.empty() ? L"" : L" \u00b7 " + gUpdateNote);
+  v.updateLabel = gInstalling   ? L"Downloading\u2026"
+                  : gUpdateBusy ? L"Checking\u2026"
+                  : v.updateReady ? L"Update to " + U2W(gUpdate.version)
+                                  : L"Check for updates";
+  v.pairAskId = gPairAsk.id;
+  v.pairAskName = gPairAsk.name;
+  v.pairAskSas = gPairAsk.sas;
+  return v;
+}
+
+// Right-click on the tray icon: just the everyday switches. The rest is in the window.
 void ShowMenu() {
   bool on = Cfg().enabled;
   HMENU m = CreatePopupMenu();
-  std::wstring pairing = PairingLeft();
-  ULONGLONG vis = TheWifiDirect().VisibleLeftMs();
-  std::wstring status = on ? PhonesLine() + L"  ·  link: " + TheWifiDirect().Status() + (pairing.empty() ? L"" : L"  ·  pairing open, " + pairing) +
-                                 (vis ? L"  ·  nearby phones can send (" + std::to_wstring((vis + 59999) / 60000) + L" min)" : L"")
-                           : L"WinDrop is off";
-  AppendMenuW(m, MF_STRING | MF_GRAYED, IDM_STATUS, status.c_str());
+  AppendMenuW(m, MF_STRING | MF_GRAYED, IDM_STATUS, BuildView().status.c_str());
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(m, MF_STRING | MF_DEFAULT, IDM_OPEN, L"Open WinDrop");
   AppendMenuW(m, MF_STRING | (on ? MF_CHECKED : 0), IDM_ON, L"On");
-  AppendMenuW(m, MF_STRING | (Cfg().pillShown ? MF_CHECKED : 0) | (on ? 0 : MF_GRAYED), IDM_PILL, L"Show pill");
-  AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), IDM_SENDCLIP, L"Send clipboard to phone\tCtrl+Alt+P");
-  size_t queued = 0;
-  HMENU q = QueueMenu(&queued);
-  std::wstring queueLabel = queued ? L"Waiting to send (" + std::to_wstring(queued) + L")" : L"Waiting to send";
-  AppendMenuW(m, MF_POPUP, (UINT_PTR)q, queueLabel.c_str());  // the menu owns q now
-  gMenuPhones = Phones();
-  if (gMenuPhones.empty()) {
-    AppendMenuW(m, MF_STRING, IDM_PAIR, L"Pair phone…");
-  } else {
-    HMENU ph = CreatePopupMenu();
-    for (size_t i = 0; i < gMenuPhones.size(); ++i)
-      AppendMenuW(ph, MF_STRING, IDM_PHONE_REMOVE + UINT(i), (L"Remove " + gMenuPhones[i].name + L"…").c_str());
-    AppendMenuW(ph, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(ph, MF_STRING | (gMenuPhones.size() >= kMaxPhones ? MF_GRAYED : 0), IDM_PAIR, L"Pair another phone…");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)ph, L"Phones");
-  }
-  // Pairing holds the Bluetooth beacon, so paired phones aren't called meanwhile: let it be ended.
-  if (!pairing.empty()) AppendMenuW(m, MF_STRING, IDM_PAIR_STOP, (L"Stop pairing (" + pairing + L")").c_str());
-  // Unpaired phones may send for 10 minutes (each one asks on the pill first).
+  AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), IDM_SENDCLIP, L"Send clipboard\tCtrl+Alt+P");
   ULONGLONG visLeft = TheWifiDirect().VisibleLeftMs();
   std::wstring visLabel = visLeft ? L"Nearby phones can send (" + std::to_wstring((visLeft + 59999) / 60000) + L" min left)"
                                   : L"Let nearby phones send (10 min)";
   AppendMenuW(m, MF_STRING | (visLeft ? MF_CHECKED : 0) | (on ? 0 : MF_GRAYED), IDM_VISIBLE, visLabel.c_str());
-  AppendMenuW(m, MF_STRING, IDM_OPENDIR, L"Open received folder");
-  HMENU logs = CreatePopupMenu();
-  AppendMenuW(logs, MF_STRING, IDM_SAVELOGS, L"Save logs to Downloads");
-  AppendMenuW(logs, MF_STRING, IDM_CLEARLOGS, L"Clear logs");
-  AppendMenuW(m, MF_POPUP, (UINT_PTR)logs, L"Logs");
-  AppendMenuW(m, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), IDM_STARTUP, L"Start with Windows");
-  std::wstring upd = gUpdate.version.empty() ? L"Check for updates (v" + U2W(WINDROP_VERSION) + L")"
-                                             : L"Update to v" + U2W(gUpdate.version) + L"…";
-  AppendMenuW(m, MF_STRING | (gUpdateBusy ? MF_GRAYED : 0), IDM_UPDATE, upd.c_str());
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(m, MF_STRING, IDM_EXIT, L"Quit");
 
@@ -490,6 +499,34 @@ void ShowMenu() {
   TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, gMain, nullptr);
   PostMessageW(gMain, WM_NULL, 0, 0);
   DestroyMenu(m);
+}
+
+// The window asked already ("Remove?" / "Cancel"), so these just do it.
+void RemovePhone(const std::string& id) {
+  std::wstring name = PhoneLabel(id);
+  std::vector<uint64_t> drop;
+  for (auto& it : TheOutbox().Snapshot())
+    if (it.phoneId == id) drop.push_back(it.id);
+  gNet.CancelOutbox(drop);
+  {
+    std::lock_guard<std::recursive_mutex> lk(CfgMutex());
+    Cfg().RemovePhone(id);
+    Cfg().Save();
+  }
+  if (TheWifiDirect().LinkedPhone() == id) TheWifiDirect().Disconnect();
+  Log("ui: removed phone %s", W2U(name).c_str());
+  UpdateTray();
+  gOverlay.Notify(L"Removed " + name, L"Pair it again from the WinDrop window to use it");
+}
+
+void CancelItem(uint64_t id) {
+  for (auto& it : TheOutbox().Snapshot()) {
+    if (it.id != id) continue;
+    gNet.CancelOutbox({id});
+    Log("ui: removed from queue: %s", it.isText ? "text" : W2U(FileNameOf(it.path)).c_str());
+    gOverlay.Notify(L"Cancelled", QueueLabel(it) + L" won't be sent");
+    return;
+  }
 }
 
 void OnCommand(UINT id) {
@@ -559,7 +596,10 @@ void OnCommand(UINT id) {
       break;
     case IDM_UPDATE:
       if (gUpdate.version.empty()) StartUpdateCheck(true);
-      else AskToUpdate();
+      else TheApp().Show();
+      break;
+    case IDM_OPEN:
+      TheApp().Show();
       break;
     case IDM_QUEUE_CLEAR: {
       std::vector<uint64_t> ids;
@@ -570,32 +610,37 @@ void OnCommand(UINT id) {
       break;
     }
     default:
-      if (id >= IDM_PHONE_REMOVE && id - IDM_PHONE_REMOVE < gMenuPhones.size()) {
-        auto p = gMenuPhones[id - IDM_PHONE_REMOVE];
-        std::wstring q = L"Remove “" + p.name + L"”?\n\nIt won't be able to send to or receive from this PC until you pair it again. Anything waiting for it is dropped.";
-        if (MessageBoxW(gMain, q.c_str(), L"WinDrop", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) != IDYES) break;
-        std::vector<uint64_t> drop;
-        for (auto& it : TheOutbox().Snapshot())
-          if (it.phoneId == p.id) drop.push_back(it.id);
-        gNet.CancelOutbox(drop);
-        {
-          std::lock_guard<std::recursive_mutex> lk(CfgMutex());
-          Cfg().RemovePhone(p.id);
-          Cfg().Save();
-        }
-        if (TheWifiDirect().LinkedPhone() == p.id) TheWifiDirect().Disconnect();
-        Log("ui: removed phone %s", W2U(p.name).c_str());
-        UpdateTray();
-        gOverlay.Notify(L"Removed " + p.name, L"Pair it again from the tray to use it");
-        break;
-      }
-      if (id >= IDM_QUEUE_ITEM && id - IDM_QUEUE_ITEM < gMenuQueue.size()) {
-        auto& it = gMenuQueue[id - IDM_QUEUE_ITEM];
-        gNet.CancelOutbox({it.id});
-        Log("ui: removed from queue: %s", it.isText ? "text" : W2U(FileNameOf(it.path)).c_str());
-        gOverlay.Notify(L"Cancelled", QueueLabel(it) + L" won't be sent");
+      break;
+  }
+  TheApp().Refresh();
+}
+
+void AppAction(AppAct a, uint64_t num, const std::string& id) {
+  switch (a) {
+    case AppAct::On: OnCommand(IDM_ON); break;
+    case AppAct::Pill: OnCommand(IDM_PILL); break;
+    case AppAct::Startup: OnCommand(IDM_STARTUP); break;
+    case AppAct::Visible: OnCommand(IDM_VISIBLE); break;
+    case AppAct::SendClip: OnCommand(IDM_SENDCLIP); break;
+    case AppAct::OpenDir: OnCommand(IDM_OPENDIR); break;
+    case AppAct::Pair: OnCommand(IDM_PAIR); break;
+    case AppAct::PairStop: OnCommand(IDM_PAIR_STOP); break;
+    case AppAct::PairYes:
+    case AppAct::PairNo: AnswerPair(num, a == AppAct::PairYes); break;
+    case AppAct::RemovePhone: RemovePhone(id); break;
+    case AppAct::CancelItem: CancelItem(num); break;
+    case AppAct::CancelAll: OnCommand(IDM_QUEUE_CLEAR); break;
+    case AppAct::Update:
+      if (gUpdate.version.empty()) {
+        gUpdateNote.clear();
+        StartUpdateCheck(true);
+      } else {
+        InstallNow();
       }
       break;
+    case AppAct::SaveLogs: OnCommand(IDM_SAVELOGS); break;
+    case AppAct::ClearLogs: OnCommand(IDM_CLEARLOGS); break;
+    case AppAct::Quit: OnCommand(IDM_EXIT); break;
   }
 }
 
@@ -620,10 +665,11 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
   switch (m) {
     case WM_APP_TRAY:
       switch (LOWORD(l)) {
-        case WM_CONTEXTMENU:
-        case WM_RBUTTONUP:
         case NIN_SELECT:
         case NIN_KEYSELECT:
+          TheApp().Toggle();
+          break;
+        case WM_CONTEXTMENU:
           ShowMenu();
           break;
       }
@@ -633,29 +679,20 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (e->type == NetEv::TextReceived) SetClipboardText(U2W(e->text));
       if (e->type == NetEv::RecvDone && IsClipboardImage(e->name)) SetClipboardImage(e->path);
       if (e->type == NetEv::PairRequest) {
-        // One prompt at a time: a newer request (the phone asked again) replaces the open one.
-        // Its MessageBoxW is further down this stack, so close it and show the new one from there.
-        if (gPairPromptOpen) {
-          gNextPairRequest = std::move(e);
-          ClosePairPrompt();
-          return 0;
-        }
-        gPairPromptOpen = true;
-        while (e) {
-          gPairPromptId = e->id;
-          // The phone shows the same number; a mismatch means someone is in the middle.
-          std::wstring sas = U2W(e->text);
-          std::wstring msg = L"Pair with \u201C" + e->name + L"\u201D?\n\nCheck that your phone shows the same number:\n\n        " +
-                             sas.substr(0, 3) + L" " + sas.substr(3) + L"\n\nOnly click Yes if the numbers match.";
-          int r = MessageBoxW(gMain, msg.c_str(), kPairPromptTitle, MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST);
-          gNet.Decide(e->id, r == IDYES);  // ignored if that request is already over
-          e = std::move(gNextPairRequest);
-        }
-        gPairPromptOpen = false;
+        // A newer request (the phone asked again) replaces the one on screen.
+        if (gPairAsk.id && gPairAsk.id != e->id) gNet.Decide(gPairAsk.id, false);
+        gPairAsk = {e->id, e->name, U2W(e->text)};
+        TheApp().Show();
+        TheApp().SetAlwaysOnTop(true);
+        TheApp().Refresh();
         return 0;
       }
       if (e->type == NetEv::PairClosed) {
-        if (gPairPromptOpen && e->id == gPairPromptId && !gNextPairRequest) ClosePairPrompt();
+        if (e->id == gPairAsk.id) {
+          gPairAsk = {};
+          TheApp().SetAlwaysOnTop(false);
+          TheApp().Refresh();
+        }
         return 0;
       }
       if (e->type == NetEv::PairDone) {
@@ -665,7 +702,8 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         UpdateTray();
         if (e->count) gOverlay.Notify(L"Paired with " + e->name, L"Transfers are now encrypted");
-        else gOverlay.Notify(L"Can't pair " + e->name, L"4 phones are paired already: tray → Phones to remove one", true);
+        else gOverlay.Notify(L"Can't pair " + e->name, L"4 phones are paired already: remove one in the WinDrop window", true);
+        TheApp().Refresh();
         return 0;
       }
       if (e->type == NetEv::Incompatible) {
@@ -680,6 +718,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       }
       if (e->type == NetEv::PeerSeen) UpdateTray();
       gOverlay.OnNetEvent(*e);
+      TheApp().Refresh();
       return 0;
     }
     case WM_COMMAND:
@@ -720,7 +759,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         KillTimer(gMain, kTimerPairEnd);
         if (!gPairedInWindow && !TheWifiDirect().Pairing()) {
           Log("ui: pairing window closed, no phone paired");
-          gOverlay.Notify(L"Pairing closed", L"No phone was paired. Tray icon → Pair phone… to try again", true);
+          gOverlay.Notify(L"Pairing closed", L"No phone was paired. Pair phone in the WinDrop window to try again", true);
         }
       }
       return 0;
@@ -737,6 +776,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         gOverlay.Notify(L"Bluetooth is off", L"Pairing and sending to your phone need it; the phone can still send here", true);
       wifiWas = wifi;
       btWas = bt;
+      TheApp().Refresh();
       return 0;
     }
     case WM_HOTKEY:
@@ -779,8 +819,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     // Hand files to the running instance (Explorer "Send to" launches us once per selection).
     // `WinDrop.exe --pair` opens the running instance's "Pair phone…" window.
-    if (HWND other = FindWindowW(kMainClass, nullptr); other && wcsstr(GetCommandLineW(), L"--pair")) {
+    HWND other = FindWindowW(kMainClass, nullptr);
+    DWORD pid = 0;
+    if (other && GetWindowThreadProcessId(other, &pid)) AllowSetForegroundWindow(pid);  // its window may come forward
+    if (other && wcsstr(GetCommandLineW(), L"--pair")) {
       PostMessageW(other, WM_COMMAND, IDM_PAIR, 0);
+    } else if (other && sendNow.empty()) {
+      PostMessageW(other, WM_COMMAND, IDM_OPEN, 0);  // started again (Start menu): show the window
     } else if (other && !sendNow.empty()) {
       std::wstring blob;
       for (auto& f : sendNow) { blob += f; blob += L'\0'; }
@@ -814,6 +859,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   gTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
   gOverlay.Create(inst, &gNet);
+  TheApp().Create(inst, gIconOn, BuildView, AppAction);
   TheWifiDirect().onLinkUp = [] { gNet.OnLinkUp(); };
   TheWifiDirect().onUnreachable = [] { PostMessageW(gMain, WM_APP_UNREACHABLE, 0, 0); };
   if (!gNet.Start(gMain)) gOverlay.Notify(L"WinDrop can't listen on port 53318", L"Is another copy running?", true);
@@ -826,6 +872,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   RegisterHotKey(gMain, kHotkeySendClipboard, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'P');
   if (!sendNow.empty() && Cfg().enabled) gOverlay.Dropped(sendNow, L"");
   SetTimer(gMain, kTimerUpdate, 30 * 1000, nullptr);  // first check shortly after start, then every 6 h
+  // Started by hand (Start menu, installer): open the window. Sign-in (--tray) and Send to don't.
+  if (sendNow.empty() && !wcsstr(GetCommandLineW(), L"--tray")) TheApp().Show();
 
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0)) {

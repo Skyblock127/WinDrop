@@ -168,7 +168,7 @@ class Island(private val svc: WinDropService) {
             DragEvent.ACTION_DRAG_EXITED -> { drag = 1; refresh() }
             DragEvent.ACTION_DROP -> {
                 drag = 0
-                val choose = svc.nearbyPcNames().isNotEmpty()  // then the pill asks where to
+                val choose = svc.nearbyPcNames().isNotEmpty() || !svc.prefs.paired  // then the pill asks where to
                 svc.handleDrop(e)
                 if (!choose) showMessage(Msg("Sending to ${svc.prefs.pcLabel}…", "Connecting", G_UP), 1500)
                 return true
@@ -313,6 +313,10 @@ class Island(private val svc: WinDropService) {
     // ---- layout + animation ----
     private var lastKey = ""
 
+    /** Where the drop pill sits: at the top, or below a drag panel the phone opens up there. */
+    private fun dragY(): Float =
+        if (svc.prefs.dropLow) svc.resources.displayMetrics.heightPixels / density * 0.3f else 8f
+
     private fun refresh() {
         val v = view ?: return
         val screenDp = svc.resources.displayMetrics.widthPixels / density
@@ -323,7 +327,7 @@ class Island(private val svc: WinDropService) {
         val choose = chooser
         look = when {
             drag != 0 -> Look(
-                if (drag == 2) 256f else 240f, if (drag == 2) 60f else 56f, 8f, false,
+                if (drag == 2) 256f else 240f, if (drag == 2) 60f else 56f, dragY(), false,
                 if (drag == 2) "Release to send" else "Drop to send",
                 svc.nearbyPcNames().let { n ->
                     when {

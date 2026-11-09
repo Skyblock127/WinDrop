@@ -35,9 +35,14 @@ class MainActivity : Activity() {
     private lateinit var master: Switch
     private lateinit var status: TextView
     private lateinit var statusDot: View
-    private lateinit var visibleBtn: Button
+    private lateinit var visibleRow: ToggleRow
+    private lateinit var visibleBar: Bar
+    private lateinit var dropRow: ToggleRow
     private var visibleAfterPermission = false
     private lateinit var pcName: TextView
+    private lateinit var pcSub: TextView
+    private lateinit var pcDot: View
+    private lateinit var pcNote: TextView
     private lateinit var pairBtn: Button
     private lateinit var setupCard: LinearLayout
     private lateinit var wifiBtn: Button
@@ -96,6 +101,70 @@ class MainActivity : Activity() {
         parent.addView(this, lp)
     }
 
+    @SuppressLint("UseSwitchCompatOrMaterialCode")
+    private fun styledSwitch() = Switch(this).apply {
+        thumbTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(Color.WHITE, 0xFFB8B9BD.toInt()))
+        trackTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(ACCENT, 0xFF3A3B3F.toInt()))
+    }
+
+    /** A whole-row switch: title, a line under it, the switch on the right (same as on the PC). */
+    private inner class ToggleRow(parent: LinearLayout, title: String, onTap: () -> Unit) {
+        val sw = styledSwitch().apply { isClickable = false; isFocusable = false }
+        val sub = label("", 13f, MUTED)
+        val row = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+            val texts = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            texts.addView(label(title, 16f, bold = true))
+            texts.addView(sub)
+            addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(sw)
+            setOnClickListener { onTap() }
+            parent.addView(this, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+
+        fun set(on: Boolean, text: String, enabled: Boolean = true) {
+            if (sw.isChecked != on) sw.isChecked = on
+            sub.text = text
+            row.alpha = if (enabled) 1f else 0.45f
+        }
+    }
+
+    /** A thin bar for time left (nearby PCs can send). */
+    private inner class Bar(parent: LinearLayout) {
+        private val fill = View(this@MainActivity).apply { background = rounded(ACCENT, 2) }
+        private val rest = View(this@MainActivity)
+        val track = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = rounded(FIELD, 2)
+            addView(fill, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0f))
+            addView(rest, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            parent.addView(this, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(4)).apply { bottomMargin = dp(6) })
+        }
+
+        fun set(frac: Float?) {
+            track.visibility = if (frac == null) View.GONE else View.VISIBLE
+            val f = (frac ?: 0f).coerceIn(0f, 1f)
+            (fill.layoutParams as LinearLayout.LayoutParams).weight = f
+            (rest.layoutParams as LinearLayout.LayoutParams).weight = 1f - f
+            track.requestLayout()
+        }
+    }
+
+    private fun clock(ms: Long): String {
+        val s = (ms + 999) / 1000
+        return "%d:%02d".format(s / 60, s % 60)
+    }
+
+    // Counts down "nearby PCs can send" while the screen is open.
+    private val tick = object : Runnable {
+        override fun run() {
+            renderVisible()
+            status.postDelayed(this, 1000)
+        }
+    }
+
     @SuppressLint("SetTextI18n", "UseSwitchCompatOrMaterialCode")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,13 +179,13 @@ class MainActivity : Activity() {
             setPadding(dp(18), dp(20), dp(18), dp(28))
         }
 
-        // ---- header: logo, name, status
+        // ---- header: logo, name, status, the on/off switch
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         header.addView(ImageView(this).apply {
             setImageResource(R.mipmap.ic_launcher)
-        }, LinearLayout.LayoutParams(dp(56), dp(56)))
+        }, LinearLayout.LayoutParams(dp(52), dp(52)))
         val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
-        titles.addView(label("WinDrop", 26f, bold = true))
+        titles.addView(label("WinDrop", 24f, bold = true))
         val statusRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         statusDot = View(this)
         statusRow.addView(statusDot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(8) })
@@ -124,31 +193,48 @@ class MainActivity : Activity() {
         statusRow.addView(status)
         titles.addView(statusRow)
         header.addView(titles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        col.addView(header)
-
-        // ---- on / off
-        val power = card(col)
-        master = Switch(this).apply {
-            text = "On"
-            textSize = 17f
-            setTextColor(TEXT)
-            thumbTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(Color.WHITE, 0xFF9A9A9A.toInt()))
-            trackTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(ACCENT, 0xFF3A3B3F.toInt()))
+        master = styledSwitch().apply {
+            scaleX = 1.15f
+            scaleY = 1.15f
             setOnCheckedChangeListener { _, on ->
                 if (rendering) return@setOnCheckedChangeListener
                 if (on) WinDropService.start(this@MainActivity) else WinDropService.stop(this@MainActivity)
                 status.postDelayed({ render() }, 300)
             }
         }
-        power.addView(master)
-        button("Send clipboard to PC", power, filled = false) { startActivity(ClipboardSendActivity.intent(this)) }
-        visibleBtn = button("Let nearby PCs send (10 min)", power, filled = false) { toggleVisible() }
+        header.addView(master)
+        col.addView(header)
+
+        // ---- send, and letting nearby PCs send
+        val main = card(col)
+        button("Send clipboard to PC", main, filled = false) { startActivity(ClipboardSendActivity.intent(this)) }
+            .apply { (layoutParams as LinearLayout.LayoutParams).topMargin = 0 }
+        visibleRow = ToggleRow(main, "Let nearby PCs send") { toggleVisible() }
+        (visibleRow.row.layoutParams as LinearLayout.LayoutParams).topMargin = dp(6)
+        visibleBar = Bar(main)
 
         // ---- pairing
         val pair = card(col)
         pair.addView(label("PAIRED PC", 12f, MUTED, bold = true).apply { letterSpacing = 0.08f })
-        pcName = label("", 17f).apply { setPadding(0, dp(4), 0, dp(12)) }
-        pair.addView(pcName)
+        val pcRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(FIELD, 14)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+        pcDot = View(this)
+        pcRow.addView(pcDot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(14) })
+        val pcTexts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        pcName = label("", 16f, bold = true)
+        pcSub = label("", 13f, MUTED)
+        pcTexts.addView(pcName)
+        pcTexts.addView(pcSub)
+        pcRow.addView(pcTexts)
+        pair.addView(pcRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(10)
+        })
+        pcNote = label("", 14f, MUTED).apply { setPadding(0, dp(10), 0, 0) }
+        pair.addView(pcNote)
         pairBtn = button("Pair with PC", pair, filled = true) {
             if (pairingNow) return@button
             if (missingPairPermissions().isNotEmpty()) {
@@ -213,6 +299,11 @@ class MainActivity : Activity() {
             WinDropService.instance?.connectNow()
             Toast.makeText(this, "Connecting to ${prefs.pcLabel}\u2026", Toast.LENGTH_SHORT).show()
         }
+
+        // ---- settings
+        val settings = card(col)
+        settings.addView(label("SETTINGS", 12f, MUTED, bold = true).apply { letterSpacing = 0.08f })
+        dropRow = ToggleRow(settings, "Drop pill lower down") { prefs.dropLow = !prefs.dropLow; render() }
 
         // ---- version and updates
         val upd = card(col)
@@ -393,9 +484,12 @@ class MainActivity : Activity() {
         // Reopened while pairing runs: show it here, and its result when it ends.
         WinDropService.instance?.takeIf { it.isPairing && !pairingNow }?.let { pairingNow = true; followPairing(it) }
         render()
+        status.removeCallbacks(tick)
+        status.post(tick)
     }
 
     override fun onPause() {
+        status.removeCallbacks(tick)
         if (Updater.screen?.get() === this) Updater.screen = null
         WinDropService.listeners -= refresh
         outbox.listeners -= refresh
@@ -493,15 +587,23 @@ class MainActivity : Activity() {
         }
         status.text = text
         statusDot.background = rounded(color, 4)
+        val connected = prefs.paired && svc?.p2p?.connectedIp != null
         pcName.text = when {
-            !prefs.paired -> "Not paired. On the PC: tray → Pair phone…, then tap Pair with PC here."
+            !prefs.paired -> "Not paired"
             prefs.lastPcName.isNotEmpty() -> prefs.lastPcName
-            else -> "Waiting for your PC"
+            else -> "Your PC"
         }
+        pcSub.text = when {
+            !prefs.paired -> "Nearby PCs can still take files: each one asks first"
+            connected -> "Connected"
+            else -> "Paired \u00b7 connects when you send"
+        }
+        pcDot.background = rounded(if (connected) GREEN else 0xFF3A3B3F.toInt(), 4)
+        pcNote.text = "On the PC: open WinDrop and click Pair phone. Then tap Pair with PC here."
+        pcNote.visibility = if (prefs.paired) View.GONE else View.VISIBLE
         renderPair()
-        val left = (svc?.visibleUntil ?: 0L) - System.currentTimeMillis()
-        visibleBtn.text = if (svc?.visible == true) "Nearby PCs can send · ${(left + 59_999) / 60_000} min left · Stop"
-            else "Let nearby PCs send (10 min)"
+        renderVisible()
+        dropRow.set(prefs.dropLow, "For phones whose own drag panel covers the top, like vivo's Drag & Go")
 
         val needWifi = prefs.enabled && !Radios.wifiOn(this)
         val needBluetooth = prefs.enabled && !Radios.bluetoothOn(this)
@@ -524,6 +626,17 @@ class MainActivity : Activity() {
         outboxList.removeAllViews()
         for (e in items) outboxList.addView(outboxRow(e))
         renderUpdate()
+    }
+
+    private fun renderVisible() {
+        val svc = WinDropService.instance
+        val on = svc?.visible == true
+        val left = ((svc?.visibleUntil ?: 0L) - System.currentTimeMillis()).coerceAtLeast(0L)
+        visibleRow.set(
+            on, if (on) "${clock(left)} left \u00b7 each one asks here first" else "For 10 minutes \u00b7 each one asks here first",
+            enabled = prefs.enabled,
+        )
+        visibleBar.set(if (on) left.toFloat() / WinDropService.VISIBLE_MS else null)
     }
 
     companion object {

@@ -36,11 +36,8 @@ class ShareReceiverActivity : Activity() {
         val prefs = Prefs(this)
         when {
             items.isEmpty() -> Toast.makeText(this, "Nothing to send", Toast.LENGTH_SHORT).show()
-            !prefs.paired -> {
-                Toast.makeText(this, "Pair WinDrop with your PC first", Toast.LENGTH_LONG).show()
-                startActivity(Intent(this, MainActivity::class.java))
-            }
             else -> {
+                // Not paired: the pill asks which nearby PC (or says none is around).
                 // Sharing to WinDrop while it's switched off turns it on: that's clearly what you want.
                 val wasOff = !prefs.enabled || WinDropService.instance == null
                 if (wasOff) {
@@ -48,8 +45,10 @@ class ShareReceiverActivity : Activity() {
                     WinDropService.start(this)
                 }
                 WinDropService.enqueue(this, items)
-                if (wasOff || !Settings.canDrawOverlays(this))
+                if (!Settings.canDrawOverlays(this) && prefs.paired)
                     Toast.makeText(this, if (wasOff) "WinDrop on \u00b7 sending to ${prefs.pcLabel}\u2026" else "Sending to ${prefs.pcLabel}\u2026", Toast.LENGTH_SHORT).show()
+                else if (wasOff)
+                    Toast.makeText(this, "WinDrop is on", Toast.LENGTH_SHORT).show()
             }
         }
         finish()

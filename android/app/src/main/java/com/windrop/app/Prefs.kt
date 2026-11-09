@@ -55,4 +55,12 @@ class Prefs(context: Context) {
             ?: "${Build.MANUFACTURER} ${Build.MODEL}"
 
     val pcLabel: String get() = lastPcName.ifEmpty { "PC" }
+
+    /**
+     * While something is dragged, the pill sits lower: some phones open their own panel along the
+     * top during a drag (vivo's Drag & Go) and it would cover the pill. On by default on those.
+     */
+    var dropLow: Boolean
+        get() = sp.getBoolean("drop_low", Build.MANUFACTURER.equals("vivo", ignoreCase = true))
+        set(v) = sp.edit().putBoolean("drop_low", v).apply()
 }
