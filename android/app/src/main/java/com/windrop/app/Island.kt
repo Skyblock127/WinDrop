@@ -53,7 +53,8 @@ class Island(private val svc: WinDropService) {
         const val PILL_MS = 3_500L
     }
 
-    class Btn(val id: Int, val label: String, val fill: Int) {
+    /** [glyph]: a round icon-only button (accept / decline) instead of a label. */
+    class Btn(val id: Int, val label: String, val fill: Int, val glyph: Int = 0) {
         val rect = RectF()
     }
 
@@ -63,6 +64,7 @@ class Island(private val svc: WinDropService) {
         val progress: Boolean = false, val highlight: Boolean = false, val clickable: Boolean = false,
         val buttons: List<Btn> = emptyList(),
         val stack: Boolean = false,  // buttons as full-width rows under the title (the PC chooser)
+        val expanded: Boolean = false,  // the whole title wrapped, labelled buttons underneath
     )
 
     class Msg(
@@ -84,9 +86,10 @@ class Island(private val svc: WinDropService) {
     private var xfer: XferUi? = null
     private var msg: Msg? = null
     private val outboxBatch = mutableListOf<Long>()
-    private var chooser: List<String>? = null
+    private var chooser: List<Pair<String, String>>? = null  // (id, label) per row
     private var chooserTitle = ""
-    private var onPick: ((Int?) -> Unit)? = null
+    private var onPick: ((String?) -> Unit)? = null
+    private var offerExpanded = false
     private val chooserTimeout = Runnable { pick(null) }
 
     var look = Look(); private set
@@ -175,10 +178,10 @@ class Island(private val svc: WinDropService) {
 
     // ---- events from the service ----
     /**
-     * "Send to which PC?": one row per target. [pick] gets the index, or null when swiped away or
-     * left for 20 s.
+     * "Send to which PC?": one row per (id, label). [pick] gets the id, or null when swiped away or
+     * left for 20 s. [updateChooser] keeps the rows current while it's open.
      */
-    fun showChooser(title: String, targets: List<String>, pick: (Int?) -> Unit) {
+    fun showChooser(title: String, targets: List<Pair<String, String>>, pick: (String?) -> Unit) {
         onPick?.invoke(null)  // an older question is moot now
         chooser = targets
         chooserTitle = title
@@ -189,17 +192,26 @@ class Island(private val svc: WinDropService) {
         refresh()
     }
 
+    fun updateChooser(targets: List<Pair<String, String>>) {
+        if (chooser == null || chooser == targets) return
+        chooser = targets
+        refresh()
+    }
+
+    val choosing get() = chooser != null
+
     private fun pick(i: Int?) {
         val cb = onPick ?: return
+        val id = i?.let { chooser?.getOrNull(it)?.first }
         onPick = null
         chooser = null
         main.removeCallbacks(chooserTimeout)
         refresh()
-        cb(i)
+        cb(id)
     }
 
     fun showOffer(id: Long, name: String, size: Long, sender: String) {
-        offer = OfferUi(id, name, size, sender); offerHidden = false; refresh()
+        offer = OfferUi(id, name, size, sender); offerHidden = false; offerExpanded = false; refresh()
     }
 
     fun closeOffer(id: Long) {
@@ -280,6 +292,11 @@ class Island(private val svc: WinDropService) {
     }
 
     fun onBodyClick() {
+        if (offer != null && !offerHidden && drag == 0 && chooser == null) {
+            offerExpanded = !offerExpanded  // show (or fold away) the whole name
+            refresh()
+            return
+        }
         val m = msg ?: return
         val click = m.onClick ?: return
         msg = null
@@ -288,6 +305,8 @@ class Island(private val svc: WinDropService) {
     }
 
     // ---- layout + animation ----
+    private var lastKey = ""
+
     private fun refresh() {
         val v = view ?: return
         val screenDp = svc.resources.displayMetrics.widthPixels / density
@@ -299,18 +318,34 @@ class Island(private val svc: WinDropService) {
         look = when {
             drag != 0 -> Look(
                 if (drag == 2) 256f else 240f, if (drag == 2) 60f else 56f, 8f, false,
-                if (drag == 2) "Release to send" else "Drop to send to PC",
-                svc.nearbyPcNames().let { n -> if (n.isEmpty()) svc.prefs.pcLabel else if (svc.prefs.paired) "${svc.prefs.pcLabel} or a nearby PC" else "A nearby PC" },
+                if (drag == 2) "Release to send" else "Drop to send",
+                svc.nearbyPcNames().let { n ->
+                    when {
+                        n.isEmpty() && svc.prefs.paired -> "To ${svc.prefs.pcLabel}"
+                        n.isEmpty() -> "Looks for nearby PCs next"
+                        svc.prefs.paired -> "Pick the PC next"
+                        else -> "To a nearby PC: pick it next"
+                    }
+                },
                 G_UP, BLUE,
                 highlight = drag == 2,
             )
-            choose != null -> Look(
-                wide, 64f + 48f * choose.size, 8f, false, chooserTitle, "Pick one", G_UP, BLUE,
-                buttons = choose.mapIndexed { i, t -> Btn(BTN_PICK + i, t, if (i == 0) BLUE else GRAY_BTN) }, stack = true,
-            )
+            o != null && !offerHidden && offerExpanded -> {
+                val lines = v.titleLines(o.name, px(wide - 12f - 34f - 10f - 12f))
+                Look(
+                    wide, 16f + 20f * lines + 4f + 18f + 14f + 36f + 14f, 8f, false, o.name, "From ${o.sender} · ${humanSize(o.size)}",
+                    G_DOWN, BLUE, clickable = true, expanded = true,
+                    buttons = listOf(Btn(BTN_DECLINE, "Decline", GRAY_BTN), Btn(BTN_ACCEPT, "Accept", BLUE)),
+                )
+            }
             o != null && !offerHidden -> Look(
-                wide, 72f, 8f, false, "PC sending ${o.name}", "${humanSize(o.size)} · from ${o.sender}", G_DOWN, BLUE,
-                buttons = listOf(Btn(BTN_DECLINE, "Decline", GRAY_BTN), Btn(BTN_ACCEPT, "Accept", BLUE)),
+                wide, 68f, 8f, false, o.name, "From ${o.sender} · ${humanSize(o.size)}", G_DOWN, BLUE, clickable = true,
+                buttons = listOf(Btn(BTN_DECLINE, "", GRAY_BTN, G_X), Btn(BTN_ACCEPT, "", BLUE, G_CHECK)),
+            )
+            choose != null -> Look(
+                wide, 64f + 48f * choose.size + if (choose.isEmpty()) 0f else 4f, 8f, false, chooserTitle,
+                "Looking for nearby PCs\u2026", G_UP, BLUE,
+                buttons = choose.mapIndexed { i, t -> Btn(BTN_PICK + i, t.second, GRAY_BTN) }, stack = true,
             )
             x != null && !xferHidden -> Look(
                 min(wide, 320f), 60f, 8f, false,
@@ -323,6 +358,9 @@ class Island(private val svc: WinDropService) {
             )
             else -> Look()
         }
+        // New content fades in; the size animates by itself.
+        val key = "${look.title}\u0001${look.sub}\u0001${look.buttons.size}\u0001${look.expanded}"
+        if (key != lastKey) { lastKey = key; v.fadeIn() }
         lp.flags = if (look.idle) idleFlags() else activeFlags()
         animateTo(look.w, look.h, look.y, v)
         v.setProgressTicking(look.progress)
@@ -371,6 +409,14 @@ class PillView(ctx: Context, private val island: Island) : View(ctx) {
     private var pressed = 0
     private var downY = 0f
     private var swiped = false
+    private var fadeAt = 0L
+
+    /** Content changed: fade it in over the next moment. */
+    fun fadeIn() { fadeAt = android.os.SystemClock.uptimeMillis(); postInvalidateOnAnimation() }
+
+    /** Lines [text] takes in the title font at [widthPx] (the expanded offer wraps the name). */
+    fun titleLines(text: String, widthPx: Int): Int =
+        android.text.StaticLayout.Builder.obtain(text, 0, text.length, title, widthPx.coerceAtLeast(1)).build().lineCount.coerceIn(1, 5)
 
     fun setProgressTicking(on: Boolean) {
         ticking = on
@@ -392,9 +438,13 @@ class PillView(ctx: Context, private val island: Island) : View(ctx) {
 
         val a = ((h - 30 * d) / (L.h * d - 30 * d)).coerceIn(0f, 1f) * ((w - L.w * d * 0.6f) / (L.w * d * 0.4f)).coerceIn(0f, 1f)
         if (a < 0.05f) return
-        val alpha = (a * 255).toInt()
+        val fade = ((android.os.SystemClock.uptimeMillis() - fadeAt) / 160f).coerceIn(0f, 1f)
+        if (fade < 1f) postInvalidateOnAnimation()
+        val alpha = (a * fade * 255).toInt()
+        if (alpha < 13) return
         val pad = 12 * d
         if (L.stack) { drawStacked(c, L, w, alpha, pad); return }
+        if (L.expanded) { drawExpanded(c, L, w, h, alpha, pad); return }
         val cy = h / 2
 
         // icon bubble
@@ -407,13 +457,18 @@ class PillView(ctx: Context, private val island: Island) : View(ctx) {
         // buttons
         var right = w - pad
         for (b in L.buttons.asReversed()) {
-            val bw = btnText.measureText(b.label) + 30 * d
-            val bh = 34 * d
+            val bw = if (b.glyph != 0) 38 * d else btnText.measureText(b.label) + 30 * d
+            val bh = if (b.glyph != 0) 38 * d else 34 * d
             b.rect.set(right - bw, cy - bh / 2, right, cy + bh / 2)
             fill.color = if (pressed == b.id) lighten(b.fill) else b.fill; fill.alpha = alpha
             c.drawRoundRect(b.rect, bh / 2, bh / 2, fill)
-            btnText.alpha = alpha
-            c.drawText(b.label, b.rect.centerX(), b.rect.centerY() - (btnText.descent() + btnText.ascent()) / 2, btnText)
+            if (b.glyph != 0) {
+                glyph.alpha = alpha
+                drawGlyph(c, b.glyph, b.rect.centerX(), b.rect.centerY(), 7 * d)
+            } else {
+                btnText.alpha = alpha
+                c.drawText(b.label, b.rect.centerX(), b.rect.centerY() - (btnText.descent() + btnText.ascent()) / 2, btnText)
+            }
             right -= bw + 8 * d
         }
 
@@ -447,6 +502,39 @@ class PillView(ctx: Context, private val island: Island) : View(ctx) {
             c.drawText(ellipsize(L.sub, sub, tw), tx, cy + 15 * d, sub)
         }
         if (ticking) postInvalidateOnAnimation()
+    }
+
+    /** The offer, expanded: the whole name wrapped, its details, labelled buttons along the bottom. */
+    private fun drawExpanded(c: Canvas, L: Island.Look, w: Float, h: Float, alpha: Int, pad: Float) {
+        val ir = 17 * d
+        val top = 16 * d
+        fill.color = L.accent; fill.alpha = alpha
+        c.drawCircle(pad + ir, top + ir, ir, fill)
+        glyph.alpha = alpha
+        drawGlyph(c, L.glyph, pad + ir, top + ir, 7 * d)
+        val tx = pad + ir * 2 + 10 * d
+        val tw = (w - tx - pad).toInt().coerceAtLeast(1)
+        title.alpha = alpha
+        sub.alpha = alpha
+        val layout = android.text.StaticLayout.Builder.obtain(L.title, 0, L.title.length, title, tw)
+            .setMaxLines(5).setEllipsize(TextUtils.TruncateAt.END).build()
+        c.save()
+        c.translate(tx, top)
+        layout.draw(c)
+        c.restore()
+        c.drawText(ellipsize(L.sub, sub, tw.toFloat()), tx, top + layout.height + 16 * d, sub)
+        var right = w - pad
+        val bh = 36 * d
+        val by = h - 14 * d - bh
+        for (b in L.buttons.asReversed()) {
+            val bw = btnText.measureText(b.label) + 40 * d
+            b.rect.set(right - bw, by, right, by + bh)
+            fill.color = if (pressed == b.id) lighten(b.fill) else b.fill; fill.alpha = alpha
+            c.drawRoundRect(b.rect, bh / 2, bh / 2, fill)
+            btnText.alpha = alpha
+            c.drawText(b.label, b.rect.centerX(), b.rect.centerY() - (btnText.descent() + btnText.ascent()) / 2, btnText)
+            right -= bw + 8 * d
+        }
     }
 
     /** Icon and title on top, then one full-width row per button. */

@@ -25,7 +25,8 @@ enum class NetEv {
   TextReceived,  // text
   Offline,       // id = outbox item id, count = outbox size
   Declined,      // name
-  Failed,        // name
+  Failed,        // name; text = why, if known (title then says it)
+  Waiting,       // a nearby phone has the offer: phone, name
   PairRequest,   // id, name = phone name, text = 6-digit check number; answer with Decide(id, ...)
   PairClosed,    // id: that pairing request is over (answered, timed out or replaced); drop its prompt
   PairDone,      // name = phone name, count = 1 on success
@@ -121,6 +122,7 @@ class NetworkEngine {
   int backoffSec_ = 15;
   ULONGLONG nextProbe_ = 0;
   std::string waking_;         // the phone the beacon is calling (one link at a time)
+  std::string failReason_;     // why the last nearby send failed (sender thread only)
   std::string calling_;        // nearby (unpaired) phone being called for a send; under tmx_
   std::string nearbyOnLink_;   // nearby phone on the link, and the link it came on
   uint64_t nearbyLinkSeq_ = 0;

@@ -18,7 +18,7 @@ using namespace winrt::Windows::Devices::Bluetooth::Advertisement;
 namespace {
 
 constexpr uint16_t kCompany = 0xFFFF;
-constexpr ULONGLONG kForgetMs = 12000;  // a phone not heard this long has gone (or stopped)
+constexpr ULONGLONG kForgetMs = 6000;  // a phone not heard this long has gone (or stopped letting PCs send)
 
 struct Seen {
   std::wstring name;

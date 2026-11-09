@@ -69,6 +69,7 @@ class WinDropService : Service() {
         private const val NOTIF_OFFER = 2
         // A link to a nearby (unpaired) PC is let go this soon after its last transfer.
         private const val OPEN_IDLE_MS = 8_000L
+        private const val OWN_PC = "\u0000own"  // the chooser's id for our paired PC
         /** "Let nearby PCs send" lasts this long. */
         const val VISIBLE_MS = 10 * 60_000L
 
@@ -124,6 +125,7 @@ class WinDropService : Service() {
     private val stopVisible = Runnable { setVisible(false) }
     // Nearby PCs that let phones send to them ("WE" beacon): name -> last heard (elapsedRealtime).
     private val nearbyPcs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    @Volatile private var nearbyError: String? = null  // why the last nearby send failed, for the pill
     private val receiving = AtomicInteger(0)
     private var bleCooldownUntil = 0L
 
@@ -404,7 +406,8 @@ class WinDropService : Service() {
             else -> "Ready · ${prefs.pcLabel}"
         }
         val n = outbox.count
-        return if (n > 0) "$pc · $n waiting" else pc
+        val vis = if (visible) " \u00B7 nearby PCs can send" else ""
+        return (if (n > 0) "$pc · $n waiting" else pc) + vis
     }
 
     // The notification is built before the link exists (startForeground runs first in onCreate).
@@ -473,11 +476,12 @@ class WinDropService : Service() {
     private fun isOwnPc(name: String) = prefs.paired &&
         (name.equals(prefs.lastPcName, ignoreCase = true) || prefs.pcP2pName.isNotEmpty() && name.startsWith(prefs.pcP2pName, ignoreCase = true))
 
+    /** Heard [name]'s "nearby phones may send" beacon in the last [ms]. */
+    private fun nearbyFresh(name: String, ms: Long) =
+        nearbyPcs[name]?.let { android.os.SystemClock.elapsedRealtime() - it < ms } == true
+
     /** Nearby PCs that take files from any phone right now (not our own), at most 3. */
-    fun nearbyPcNames(): List<String> {
-        val now = android.os.SystemClock.elapsedRealtime()
-        return nearbyPcs.filter { now - it.value < 12_000 && !isOwnPc(it.key) }.keys.sorted().take(3)
-    }
+    fun nearbyPcNames(): List<String> = nearbyPcs.keys.filter { nearbyFresh(it, 9_000) && !isOwnPc(it) }.sorted().take(3)
 
     /** A nearby PC is visible ([call] null), or calls us because it has something for us. */
     private fun onNearbyBeacon(call: ByteArray?, name: String, pcWifiOff: Boolean) {
@@ -509,23 +513,40 @@ class WinDropService : Service() {
         if (hadLink) main.postDelayed(go, 1000) else go.run()
     }
 
-    /** "Send to which PC?" in the pill, when nearby PCs are around. */
-    private fun chooseTarget(nearby: List<String>) {
+    private fun chooserTargets(): List<Pair<String, String>> =
+        (if (prefs.paired) listOf(OWN_PC to "${prefs.pcLabel} \u00B7 paired") else emptyList()) +
+            nearbyPcNames().map { it to "$it \u00B7 nearby" }
+
+    // Keeps the chooser's rows current: nearby PCs come and go while it's open.
+    private val chooserTick = object : Runnable {
+        override fun run() {
+            if (!island.choosing) return
+            island.updateChooser(chooserTargets())
+            main.postDelayed(this, 1000)
+        }
+    }
+
+    /** "Send to which PC?" in the pill: our own PC and the nearby ones, kept up to date. */
+    private fun chooseTarget() {
         val items = generateSequence { pending.poll() }.toList()
         if (items.isEmpty()) return
-        val own = prefs.paired
-        val targets = (if (own) listOf(prefs.pcLabel) else emptyList()) + nearby
         val what = if (items.size == 1) items[0].name else "${items.size} items"
-        island.showChooser("Send $what to\u2026", targets) { i ->
-            when {
-                i == null -> {
+        var seenAny = false
+        island.showChooser("Send $what to\u2026", chooserTargets().also { seenAny = it.isNotEmpty() }) { id ->
+            main.removeCallbacks(chooserTick)
+            when (id) {
+                null -> {
                     items.forEach { it.close() }
-                    island.showMessage(Island.Msg("Not sent", what, Island.G_X, Island.GRAY_BTN), 1500)
+                    if (!seenAny && nearbyPcNames().isEmpty() && !prefs.paired)
+                        island.showMessage(Island.Msg("No PC found nearby", "Pair in WinDrop, or on the PC: Let nearby phones send", Island.G_WARN, Island.AMBER), 3500)
+                    else island.showMessage(Island.Msg("Not sent", what, Island.G_X, Island.GRAY_BTN), 1500)
                 }
-                own && i == 0 -> { pending.addAll(items); drainPending(choose = false) }
-                else -> sendNearby(items, targets[i])
+                OWN_PC -> { pending.addAll(items); drainPending(choose = false) }
+                else -> sendNearby(items, id)
             }
         }
+        main.removeCallbacks(chooserTick)
+        main.postDelayed(chooserTick, 1000)
     }
 
     private fun sendNearby(items: List<OutgoingItem>, pc: String) {
@@ -536,11 +557,28 @@ class WinDropService : Service() {
         }
         Logs.i("nearby: sending ${items.size} item(s) to $pc")
         queued.addAndGet(items.size)
-        startOpenLink(pc, incoming = false)
         sender.execute {
+            // It may have stopped taking files a moment ago: make sure before joining it.
+            if (!nearbyFresh(pc, 4_000)) {
+                ui(Island.Msg("Looking for $pc\u2026", "Checking it still takes files", Island.G_UP), 3000, "Looking for $pc\u2026")
+                val until = System.currentTimeMillis() + 6_000
+                while (!nearbyFresh(pc, 4_000) && System.currentTimeMillis() < until && !stopped) Thread.sleep(250)
+            }
+            if (!nearbyFresh(pc, 4_000)) {
+                Logs.w("nearby: $pc is gone")
+                ui(Island.Msg("$pc isn't taking files now", "It stopped letting nearby phones send", Island.G_WARN, Island.AMBER), 3500,
+                    "$pc isn't taking files now")
+                items.forEach { it.close() }
+                if (queued.addAndGet(-items.size) == 0) main.post { island.transferEnded(); updateServiceNotification() }
+                return@execute
+            }
+            main.post { startOpenLink(pc, incoming = false) }
             val until = System.currentTimeMillis() + 50_000
             fun linked() = p2p.openTarget == pc && p2p.connectedIp != null
-            while (!linked() && System.currentTimeMillis() < until && !stopped) Thread.sleep(250)
+            while (!linked() && System.currentTimeMillis() < until && !stopped) {
+                if (!nearbyFresh(pc, 10_000)) { nearbyError = "$pc stopped taking files from nearby phones"; break }
+                Thread.sleep(250)
+            }
             if (!linked()) Logs.w("nearby: couldn't reach $pc")
             for (item in items) process(item, to = pc)
         }
@@ -561,6 +599,7 @@ class WinDropService : Service() {
             val peer = OpenHello.client(s, prefs.deviceId, prefs.deviceName)
             if (peer == null) {
                 Logs.w("nearby: the PC isn't taking files from nearby phones (any more)")
+                nearbyError = "${p2p.openTarget ?: "The PC"} stopped taking files from nearby phones"
                 runCatching { s.close() }
                 return null
             }
@@ -599,10 +638,14 @@ class WinDropService : Service() {
     private fun drainPending(choose: Boolean = true) {
         if (choose && pending.isNotEmpty()) {
             val nearby = nearbyPcNames()
-            if (nearby.isNotEmpty() && island.attached) { chooseTarget(nearby); return }
-            // Not paired and no pill to ask with: the nearby PC it is.
-            if (!prefs.paired && nearby.isNotEmpty()) {
-                sendNearby(generateSequence { pending.poll() }.toList(), nearby[0])
+            // Nearby PCs around, or no PC of our own: ask (the list keeps looking while it asks).
+            if ((nearby.isNotEmpty() || !prefs.paired) && island.attached) { chooseTarget(); return }
+            if (!prefs.paired) {
+                val items = generateSequence { pending.poll() }.toList()
+                // No pill to ask with: the nearby PC it is, if there's one.
+                if (nearby.isNotEmpty()) { sendNearby(items, nearby[0]); return }
+                items.forEach { it.close() }
+                toast("Not paired with a PC. Pair in WinDrop, or on the PC: Let nearby phones send")
                 return
             }
         }
@@ -620,17 +663,33 @@ class WinDropService : Service() {
         stopIfIdle()
     }
 
-    private enum class Result { OK, OFFLINE, DECLINED, FAILED }
+    private enum class Result { OK, OFFLINE, DECLINED, FAILED, NOT_PAIRED }
 
     /** [to]: a nearby (unpaired) PC's name; nothing for it goes to the outbox. */
     private fun process(item: OutgoingItem, to: String? = null) {
         try {
             if (item.outboxId != null && flushAbort) return
+            var target = to
             var r = try { send(item, to) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
-            Logs.i("send ${item.name}${if (to != null) " to $to" else ""} -> $r")
-            val label = to ?: prefs.pcLabel
-            if (to != null && r == Result.OFFLINE) {
-                ui(Island.Msg("Couldn't reach $to", item.name, Island.G_WARN, Island.AMBER), 3000, "Couldn't reach $to")
+            if (r == Result.NOT_PAIRED) {
+                // Our PC removed this phone. If it takes files from nearby phones, send it that way.
+                val near = nearbyPcs.keys.firstOrNull { isOwnPc(it) && nearbyFresh(it, 9_000) }
+                forgetPairing(keepLink = near != null)
+                r = Result.FAILED
+                if (near != null) {
+                    Logs.i("nearby: $near forgot this phone; sending as a nearby phone instead")
+                    p2p.openTarget = near  // same PC, same link: it just isn't ours any more
+                    target = near
+                    r = try { send(item, near) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
+                }
+            }
+            Logs.i("send ${item.name}${if (target != null) " to $target" else ""} -> $r")
+            val label = target ?: prefs.pcLabel
+            val reason = nearbyError
+            nearbyError = null
+            if (target != null && (r == Result.OFFLINE || r == Result.FAILED)) {
+                val title = reason ?: if (r == Result.OFFLINE) "Couldn't reach $target" else "Transfer failed"
+                ui(Island.Msg(title, "${item.name} wasn't sent", Island.G_WARN, Island.AMBER), 3500, title)
                 return
             }
             when (r) {
@@ -661,7 +720,7 @@ class WinDropService : Service() {
                     item.outboxId?.let { outbox.remove(it) }
                     ui(Island.Msg("$label declined ${item.name}", glyph = Island.G_X, accent = Island.RED), 2500, "$label declined")
                 }
-                Result.FAILED -> ui(Island.Msg("Transfer failed", item.name, Island.G_WARN, Island.RED), 3000, "Transfer failed")
+                Result.FAILED, Result.NOT_PAIRED -> ui(Island.Msg("Transfer failed", item.name, Island.G_WARN, Island.RED), 3000, "Transfer failed")
             }
         } finally {
             item.close()
@@ -686,7 +745,7 @@ class WinDropService : Service() {
             if (p2p.openTarget != to || p2p.connectedIp == null) return Result.OFFLINE
             openNearbyChannel() ?: return Result.FAILED
         } else try { openChannel() } catch (e: Incompatible) { reportIncompatible(e.peer); return Result.FAILED }
-            catch (e: NotPaired) { forgetPairing(); return Result.FAILED }
+            catch (e: NotPaired) { return Result.NOT_PAIRED }
             ?: return if (prefs.paired) Result.OFFLINE else Result.FAILED
         s.use {
             val out = ch.output
@@ -696,6 +755,7 @@ class WinDropService : Service() {
                     if (item.isText) "text.txt" else item.name, prefs.deviceName, prefs.deviceId))
                 out.flush()
             } catch (e: IOException) { return Result.OFFLINE }
+            if (to != null) ui(Island.Msg("Waiting for $to to accept", item.name, Island.G_UP), 3500, "Waiting for $to to accept")
 
             val d = try { inp.read() } catch (e: SocketTimeoutException) { return Result.FAILED } catch (e: IOException) { -1 }
             if (d == -1) return Result.FAILED
@@ -1171,15 +1231,18 @@ class WinDropService : Service() {
     }
 
     /** The PC removed this phone: stop calling it and say how to pair again. */
-    private fun forgetPairing() {
+    /** [keepLink]: the PC takes files from nearby phones, and we go on sending to it that way. */
+    private fun forgetPairing(keepLink: Boolean = false) {
         if (!prefs.paired) return
         val pc = prefs.pcLabel
         Logs.w("$pc no longer has this phone paired; forgetting the pairing")
         prefs.pairKey = null
         prefs.pairedPcId = ""
         main.post {
-            p2p.release()
-            ui(Island.Msg("$pc removed this phone", "Pair again from the WinDrop app", Island.G_WARN, Island.AMBER), 5000,
+            if (!keepLink) p2p.release()
+            if (keepLink) ui(Island.Msg("$pc removed this phone", "Sending as a nearby phone: accept it on the PC", Island.G_WARN, Island.AMBER), 3500,
+                "$pc removed this phone; sending as a nearby phone")
+            else ui(Island.Msg("$pc removed this phone", "Pair again from the WinDrop app", Island.G_WARN, Island.AMBER), 5000,
                 "$pc removed this phone. Pair again from the WinDrop app.")
             updateServiceNotification()
             notifyListeners()

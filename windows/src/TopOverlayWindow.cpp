@@ -22,12 +22,13 @@ namespace td {
 namespace {
 
 constexpr wchar_t kClass[] = L"WinDropOverlay";
-constexpr UINT_PTR kPollTimer = 1, kAnimTimer = 2, kMsgTimer = 3, kXferTimer = 4;
+constexpr UINT_PTR kPollTimer = 1, kAnimTimer = 2, kMsgTimer = 3, kXferTimer = 4, kChooseTimer = 5;
 constexpr UINT kPillMs = 4000;  // a pill shows this long, then gets out of the way
 // While a drag is near the top, the window grows into an invisible band this big (DIPs) so a
 // drop anywhere along the top edge counts, not only on the pill itself.
 constexpr float kBandW = 720, kBandH = 130;
-constexpr int kBtnAccept = 1, kBtnDecline = 2, kBtnCancelOutbox = 3;
+constexpr int kBtnAccept = 1, kBtnDecline = 2, kBtnCancelOutbox = 3, kBtnPick = 100;  // + row
+constexpr ULONGLONG kFadeMs = 160;
 
 // Solid, non-purple palette.
 constexpr uint32_t kBg = 0xF51E1E1E;
@@ -84,8 +85,6 @@ std::string DefaultPhone() {
   std::lock_guard<std::recursive_mutex> lk(CfgMutex());
   return Cfg().DefaultPhone();
 }
-
-constexpr float kSpotW = 220, kSpotW4 = 196, kSpotGap = 12;  // drop spots, one per phone
 
 bool LooksLikeUrl(const std::wstring& t) {
   return (t.rfind(L"http://", 0) == 0 || t.rfind(L"https://", 0) == 0) && t.find_first_of(L" \r\n\t") == std::wstring::npos;
@@ -148,6 +147,12 @@ void TopOverlay::Dismiss() {
   drag_ = 0;
   msg_.active = false;
   outboxBatch_.clear();
+  if (choose_.active) {
+    choose_ = {};
+    KillTimer(hwnd_, kChooseTimer);
+    Notify(L"Not sent", L"Nothing was sent");
+    return;
+  }
   if (xfer_.active) xferHidden_ = true;
   KillTimer(hwnd_, kMsgTimer);
   Refresh();
@@ -170,6 +175,7 @@ LRESULT TopOverlay::Handle(UINT m, WPARAM w, LPARAM l) {
     case WM_TIMER:
       if (w == kPollTimer) PollDrag();
       else if (w == kAnimTimer) Tick();
+      else if (w == kChooseTimer) UpdateChooser();
       else if (w == kXferTimer) {
         KillTimer(hwnd_, kXferTimer);
         if (xfer_.active) { xferHidden_ = true; Refresh(); }
@@ -287,17 +293,6 @@ void TopOverlay::PollDrag() {
     if (moved && startedBelow && atEdge && !moveSize) {
       monitor_ = mon;
       drag_ = 1;
-      spotPhones_.clear();
-      // One spot per paired phone, plus nearby (unpaired) phones that are visible right now.
-      auto phones = Phones();
-      auto nearby = NearbyPhones();
-      if (phones.size() > 1 || !nearby.empty()) {
-        for (auto& p : phones) spotPhones_.push_back(p.id);
-        for (auto& n : nearby)
-          if (spotPhones_.size() < 4) spotPhones_.push_back(n.id);
-      }
-      hotSpot_ = -1;
-      spotRects_.clear();
       TheWifiDirect().Prewarm(DefaultPhone());  // start waking the phone while the user is still dragging
       Log("ui: drag heading for the pill, prewarming link");
       Refresh();
@@ -318,27 +313,6 @@ void TopOverlay::DragEntered() {
   Refresh();
 }
 
-// While a drag hovers the spots, light up the one under the cursor and start waking that phone.
-void TopOverlay::DragMoved(POINT pt) {
-  int i = SpotAt(pt);
-  if (i == hotSpot_) return;
-  hotSpot_ = i;
-  if (i >= 0) TheWifiDirect().Prewarm(spotPhones_[i]);
-  look_.hot = i;
-  Render();
-}
-
-int TopOverlay::SpotAt(POINT pt) const {
-  int best = -1;
-  LONG bestD = LONG_MAX;
-  for (size_t i = 0; i < spotRects_.size(); ++i) {
-    const RECT& r = spotRects_[i];
-    LONG d = pt.x < r.left ? r.left - pt.x : pt.x > r.right ? pt.x - r.right : 0;
-    if (d < bestD) { bestD = d; best = (int)i; }
-  }
-  return best;
-}
-
 float TopOverlay::BandW() const { return max(kBandW, look_.w + 60); }
 
 void TopOverlay::DragLeft() {
@@ -350,12 +324,55 @@ void TopOverlay::Dropped(const std::vector<std::wstring>& files, const std::wstr
   oleInside_ = false;
   drag_ = 0;
   TheWifiDirect().EndPrewarm();
-  POINT pt;
-  GetCursorPos(&pt);
-  int spot = SpotAt(pt);
-  std::string phone = spot >= 0 && spot < (int)spotPhones_.size() ? spotPhones_[spot] : DefaultPhone();
-  spotPhones_.clear();
-  spotRects_.clear();
+  Send(files, text);
+}
+
+std::vector<std::string> TopOverlay::Targets() const {
+  std::vector<std::string> ids;
+  std::string def = DefaultPhone();
+  if (!def.empty()) ids.push_back(def);
+  for (auto& p : Phones())
+    if (p.id != def) ids.push_back(p.id);
+  for (auto& n : NearbyPhones())
+    if (ids.size() < 6) ids.push_back(n.id);
+  return ids;
+}
+
+void TopOverlay::Send(const std::vector<std::wstring>& files, const std::wstring& text) {
+  auto ids = Targets();
+  bool nearby = std::any_of(ids.begin(), ids.end(), [](const std::string& id) { return IsNearbyId(id); });
+  if (ids.size() == 1 && !nearby) { Deliver(ids[0], files, text); return; }
+  if (ids.empty() && !Phones().empty()) { Deliver(DefaultPhone(), files, text); return; }
+  // Ask where to. The list keeps itself current: nearby phones come and go.
+  choose_ = {};
+  choose_.active = true;
+  choose_.files = files;
+  choose_.text = text;
+  choose_.what = files.size() > 1 ? std::to_wstring(files.size()) + L" files"
+                 : !files.empty()  ? FileNameOf(files[0])
+                                   : L"text";
+  choose_.ids = ids;
+  choose_.until = GetTickCount64() + 20000;
+  SetTimer(hwnd_, kChooseTimer, 1000, nullptr);
+  Log("ui: asking where to send (%zu choices)", ids.size());
+  Refresh();
+}
+
+void TopOverlay::UpdateChooser() {
+  if (!choose_.active) { KillTimer(hwnd_, kChooseTimer); return; }
+  if (GetTickCount64() > choose_.until) {
+    bool none = choose_.ids.empty();
+    choose_ = {};
+    KillTimer(hwnd_, kChooseTimer);
+    if (none) Notify(L"No phone found nearby", L"Pair one (tray → Pair phone…), or on the phone: Let nearby PCs send", true);
+    else Notify(L"Not sent", L"No phone was picked");
+    return;
+  }
+  auto ids = Targets();
+  if (ids != choose_.ids) { choose_.ids = ids; Refresh(); }
+}
+
+void TopOverlay::Deliver(const std::string& phone, const std::vector<std::wstring>& files, const std::wstring& text) {
   std::vector<std::wstring> send;
   int dirs = 0;
   for (auto& f : files) {
@@ -371,7 +388,7 @@ void TopOverlay::Dropped(const std::vector<std::wstring>& files, const std::wstr
   } else {
     Message m;
     m.title = send.size() > 1 ? L"Sending " + std::to_wstring(send.size()) + L" files to " + PhoneLabel(phone) : L"Sending to " + PhoneLabel(phone) + L"…";
-    m.sub = L"Connecting";
+    m.sub = IsNearbyId(phone) ? L"Connecting to it; it accepts on its screen" : L"Connecting";
     m.glyph = kGlyphUp;
     m.accent = kBlue;
     ShowMessage(m, 2000);
@@ -493,11 +510,20 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       ShowMessage(m, 2500);
       break;
     }
+    case NetEv::Waiting: {
+      Message m;
+      m.title = L"Waiting for " + PhoneLabel(e.phone) + L" to accept";
+      m.sub = e.name;
+      m.glyph = kGlyphUp;
+      m.accent = kBlue;
+      ShowMessage(m, kPillMs);
+      break;
+    }
     case NetEv::Failed: {
       xfer_.active = false;
       Message m;
-      m.title = L"Transfer failed";
-      m.sub = e.name;
+      m.title = e.text.empty() ? L"Transfer failed" : U2W(e.text);
+      m.sub = e.text.empty() ? e.name : e.name + L" wasn't sent";
       m.glyph = kGlyphWarn;
       m.accent = kRed;
       ShowMessage(m, 3000);
@@ -512,9 +538,17 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
 }
 
 void TopOverlay::OnButton(int id) {
-  if ((id == kBtnAccept || id == kBtnDecline) && offer_.active) {
+  if (id >= kBtnPick && choose_.active) {
+    size_t i = (size_t)(id - kBtnPick);
+    if (i >= choose_.ids.size()) return;
+    auto c = choose_;
+    choose_ = {};
+    KillTimer(hwnd_, kChooseTimer);
+    Deliver(c.ids[i], c.files, c.text);
+  } else if ((id == kBtnAccept || id == kBtnDecline) && offer_.active) {
     net_->Decide(offer_.id, id == kBtnAccept);
     offer_.active = false;
+    offerExpanded_ = false;
     Refresh();
   } else if (id == kBtnCancelOutbox) {
     net_->CancelOutbox(outboxBatch_);
@@ -530,6 +564,11 @@ void TopOverlay::OnButton(int id) {
 }
 
 void TopOverlay::OnBodyClick() {
+  if (offer_.active && !drag_) {  // show (or fold away) the whole name
+    offerExpanded_ = !offerExpanded_;
+    Refresh();
+    return;
+  }
   if (!msg_.active || msg_.openPath.empty()) return;
   if (msg_.isUrl) {
     ShellExecuteW(nullptr, L"open", msg_.openPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -554,29 +593,56 @@ void TopOverlay::Refresh() {
     L.w = drag_ == 2 ? 340.f : 320.f;
     L.h = drag_ == 2 ? 68.f : 64.f;
     L.y = 8;
-    L.title = drag_ == 2 ? L"Release to send" : L"Drop to send to phone";
-    L.sub = PhoneLabel(DefaultPhone());
+    L.title = drag_ == 2 ? L"Release to send" : L"Drop to send";
+    // One paired phone and nobody nearby: it goes there. Otherwise the pill asks after the drop.
+    auto ids = Targets();
+    bool nearby = std::any_of(ids.begin(), ids.end(), [](const std::string& id) { return IsNearbyId(id); });
+    L.sub = ids.empty()                ? L"Looks for nearby phones next"
+            : ids.size() == 1 && !nearby ? L"To " + PhoneLabel(ids[0])
+            : Phones().empty()          ? L"To a nearby phone: pick it next"
+                                        : L"Pick the phone next";
     L.glyph = kGlyphUp;
     L.accent = kBlue;
     L.highlight = drag_ == 2;
-    if (!spotPhones_.empty()) {
-      size_t n = spotPhones_.size();
-      for (auto& id : spotPhones_) L.spots.push_back(IsNearbyId(id) ? PhoneLabel(id) + L" (nearby)" : PhoneLabel(id));
-      L.w = n * (n > 2 ? kSpotW4 : kSpotW) + (n - 1) * kSpotGap;
-      L.h = 64;
-      L.hot = hotSpot_;
-    }
   } else if (offer_.active) {
     L.idle = false;
     L.w = 430;
-    L.h = 76;
     L.y = 10;
-    L.title = L"Phone sending " + offer_.name;
-    L.sub = HumanSize(offer_.size) + L" · from " + offer_.sender;
+    L.title = offer_.name;
+    L.sub = L"From " + offer_.sender + L" · " + HumanSize(offer_.size);
     L.glyph = kGlyphDown;
     L.accent = kBlue;
-    L.buttons.push_back({L"Decline", kBtnDecline, kGrayBtn});
-    L.buttons.push_back({L"Accept", kBtnAccept, kBlue});
+    L.clickable = true;
+    if (offerExpanded_) {
+      // The whole name, wrapped, and labelled buttons underneath.
+      L.expanded = true;
+      Gdiplus::Graphics g(memDC_);
+      Gdiplus::Font f(L"Segoe UI Semibold", 14, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+      Gdiplus::RectF box;
+      g.MeasureString(L.title.c_str(), -1, &f, Gdiplus::RectF(0, 0, L.w - 14 - 36 - 12 - 14, 2000), nullptr, &box);
+      L.titleH = std::clamp(box.Height, 20.f, 120.f);
+      L.h = 16 + L.titleH + 4 + 18 + 14 + 32 + 14;
+      L.buttons.push_back({L"Decline", kBtnDecline, kGrayBtn});
+      L.buttons.push_back({L"Accept", kBtnAccept, kBlue});
+    } else {
+      L.h = 72;
+      L.buttons.push_back({L"", kBtnDecline, kGrayBtn, kGlyphCancel});
+      L.buttons.push_back({L"", kBtnAccept, kBlue, kGlyphCheck});
+    }
+  } else if (choose_.active) {
+    L.idle = false;
+    L.w = 400;
+    L.y = 10;
+    L.stack = true;
+    L.title = L"Send " + choose_.what + L" to…";
+    L.sub = L"Looking for nearby phones…";
+    L.glyph = kGlyphUp;
+    L.accent = kBlue;
+    for (size_t i = 0; i < choose_.ids.size(); ++i) {
+      auto& id = choose_.ids[i];
+      L.buttons.push_back({PhoneLabel(id) + (IsNearbyId(id) ? L" · nearby" : L" · paired"), kBtnPick + (int)i, kGrayBtn});
+    }
+    L.h = 64 + 46.f * L.buttons.size() + (L.buttons.empty() ? 0 : 6);
   } else if (xfer_.active && !xferHidden_ && pillShown_) {
     L.idle = false;
     L.w = 380;
@@ -600,6 +666,12 @@ void TopOverlay::Refresh() {
     L.accent = msg_.accent;
     L.buttons = msg_.buttons;
     L.clickable = !msg_.openPath.empty();
+  }
+  // New content fades in; the size animates by itself.
+  std::wstring key = L.title + L"\x1f" + L.sub + L"\x1f" + std::to_wstring(L.buttons.size()) + (L.expanded ? L"e" : L"");
+  if (key != fadeKey_) {
+    fadeKey_ = key;
+    fadeAt_ = GetTickCount64();
   }
   look_ = L;
 
@@ -641,6 +713,7 @@ void TopOverlay::Tick() {
   step(cw_, tw);
   step(ch_, th);
   step(cy_, ty);
+  if (GetTickCount64() - fadeAt_ < kFadeMs + 20) settled = false;
   if (look_.idle && (settled || ch_ < 3.f)) {
     ShowWindow(hwnd_, SW_HIDE);
     visible_ = false;
@@ -652,6 +725,85 @@ void TopOverlay::Tick() {
   if (settled && !look_.progress) {
     KillTimer(hwnd_, kAnimTimer);
     animating_ = false;
+  }
+}
+
+// The tall pills: the "send to which phone" list (rows under the title) and the expanded offer
+// (whole name wrapped, labelled buttons underneath).
+void TopOverlay::DrawTall(Gdiplus::Graphics& g, int W, int H, float s, float ca, int px, int py) {
+  using namespace Gdiplus;
+  auto& F = FontsFor(s);
+  float pad = 14 * s, d = 36 * s;
+  float top = 14 * s;
+  SolidBrush ib(Fade(look_.accent, ca));
+  g.FillEllipse(&ib, pad, top, d, d);
+  StringFormat cf;
+  cf.SetAlignment(StringAlignmentCenter);
+  cf.SetLineAlignment(StringAlignmentCenter);
+  SolidBrush white(Fade(0xFFFFFFFF, ca));
+  SolidBrush gray(Fade(0xFFB4B4B4, ca));
+  if (look_.glyph) {
+    wchar_t gs[2] = {look_.glyph, 0};
+    g.DrawString(gs, 1, F.icon.get(), RectF(pad, top, d, d), &cf, &white);
+  }
+  float tx = pad + d + 12 * s, tw = max(10.f, W - tx - pad);
+  StringFormat one;
+  one.SetTrimming(StringTrimmingEllipsisCharacter);
+  one.SetFormatFlags(StringFormatFlagsNoWrap);
+  one.SetLineAlignment(StringAlignmentCenter);
+  float y;
+  if (look_.expanded) {
+    StringFormat wrap;
+    wrap.SetTrimming(StringTrimmingEllipsisCharacter);
+    g.DrawString(look_.title.c_str(), -1, F.title.get(), RectF(tx, top, tw, look_.titleH * s), &wrap, &white);
+    y = top + look_.titleH * s + 4 * s;
+    g.DrawString(look_.sub.c_str(), -1, F.sub.get(), RectF(tx, y, tw, 18 * s), &one, &gray);
+  } else {
+    g.DrawString(look_.title.c_str(), -1, F.title.get(), RectF(tx, top + d / 2 - 20 * s, tw, 20 * s), &one, &white);
+    g.DrawString(look_.sub.c_str(), -1, F.sub.get(), RectF(tx, top + d / 2 + 1 * s, tw, 18 * s), &one, &gray);
+  }
+  if (look_.stack) {
+    // One full-width row per choice.
+    y = 64 * s;
+    float bh = 38 * s;
+    for (auto& b : look_.buttons) {
+      RectF r(pad, y, W - 2 * pad, bh);
+      GraphicsPath bp;
+      AddRoundRect(bp, r.X, r.Y, r.Width, r.Height, bh / 2);
+      uint32_t fill = hoverBtn_ == b.id ? kBlue : b.fill;
+      SolidBrush fb(Fade(fill, ca));
+      g.FillPath(&fb, &bp);
+      StringFormat bf;
+      bf.SetAlignment(StringAlignmentCenter);
+      bf.SetLineAlignment(StringAlignmentCenter);
+      bf.SetTrimming(StringTrimmingEllipsisCharacter);
+      bf.SetFormatFlags(StringFormatFlagsNoWrap);
+      g.DrawString(b.label.c_str(), -1, F.btn.get(), RectF(r.X + 12 * s, r.Y, r.Width - 24 * s, r.Height), &bf, &white);
+      b.rc = RECT{(LONG)r.X + px, (LONG)r.Y + py, (LONG)(r.X + r.Width) + px, (LONG)(r.Y + r.Height) + py};
+      y += bh + 8 * s;
+    }
+    return;
+  }
+  // Expanded: buttons right-aligned along the bottom.
+  float right = W - pad, bh = 32 * s, by = H - 14 * s - bh;
+  StringFormat bf;
+  bf.SetAlignment(StringAlignmentCenter);
+  bf.SetLineAlignment(StringAlignmentCenter);
+  for (int i = (int)look_.buttons.size() - 1; i >= 0; --i) {
+    auto& b = look_.buttons[i];
+    RectF m;
+    g.MeasureString(b.label.c_str(), -1, F.btn.get(), PointF(0, 0), &m);
+    float bw = m.Width + 36 * s;
+    RectF r(right - bw, by, bw, bh);
+    GraphicsPath bp;
+    AddRoundRect(bp, r.X, r.Y, r.Width, r.Height, bh / 2);
+    uint32_t fill = b.fill;
+    if (hoverBtn_ == b.id) fill = (fill & 0xFF000000) | (((fill & 0xFEFEFE) >> 1) + 0x404040);
+    SolidBrush fb(Fade(fill, ca));
+    g.FillPath(&fb, &bp);
+    g.DrawString(b.label.c_str(), -1, F.btn.get(), r, &bf, &white);
+    b.rc = RECT{(LONG)r.X + px, (LONG)r.Y + py, (LONG)(r.X + r.Width) + px, (LONG)(r.Y + r.Height) + py};
+    right -= bw + 8 * s;
   }
 }
 
@@ -667,7 +819,7 @@ void TopOverlay::Render() {
   int WW = band ? max(W, (int)std::lround(BandW() * s)) : W;
   int WH = band ? max(H + py, (int)std::lround(kBandH * s)) : H;
   int px = (WW - W) / 2;
-  int needW = (int)std::ceil(max(460.f, BandW()) * s) + 2, needH = (int)std::ceil(max(90.f, kBandH) * s) + 2;
+  int needW = (int)std::ceil(max(460.f, BandW()) * s) + 2, needH = (int)std::ceil(max(look_.h + 20, kBandH) * s) + 2;
   if (needW > dibW_ || needH > dibH_ || !dib_) {
     if (dib_) { SelectObject(memDC_, oldBmp_); DeleteObject(dib_); }
     BITMAPINFO bi{};
@@ -694,7 +846,6 @@ void TopOverlay::Render() {
       for (int x = 0; x < WW; ++x) px32[(size_t)y * dibW_ + x] = 0x01000000;
   }
 
-  std::vector<RECT> spotLocal;  // drop spots, window coordinates
   {
     Bitmap bmp(WW, WH, dibW_ * 4, PixelFormat32bppPARGB, (BYTE*)bits_);
     Graphics g(&bmp);
@@ -703,45 +854,6 @@ void TopOverlay::Render() {
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
 
-    if (!look_.spots.empty()) {
-      // One pill per phone, side by side; the one under the cursor is outlined.
-      auto& F = FontsFor(s);
-      size_t n = look_.spots.size();
-      float gap = kSpotGap * s;
-      float sw = (W - gap * (n - 1)) / n;
-      float ca = std::clamp((cw_ - look_.w * 0.6f) / (look_.w * 0.4f), 0.f, 1.f) *
-                 std::clamp(look_.h > 30 ? (ch_ - 30) / (look_.h - 30) : 0.f, 0.f, 1.f);
-      StringFormat tf;
-      tf.SetTrimming(StringTrimmingEllipsisCharacter);
-      tf.SetFormatFlags(StringFormatFlagsNoWrap);
-      tf.SetLineAlignment(StringAlignmentCenter);
-      StringFormat cf;
-      cf.SetAlignment(StringAlignmentCenter);
-      cf.SetLineAlignment(StringAlignmentCenter);
-      for (size_t i = 0; i < n; ++i) {
-        float x = i * (sw + gap);
-        bool hot = (int)i == look_.hot;
-        GraphicsPath p;
-        AddRoundRect(p, x + 0.5f, 0.5f, sw - 1.f, H - 1.f, min(H / 2.f, 30 * s));
-        SolidBrush bg(Fade(kBg, 1));
-        g.FillPath(&bg, &p);
-        Pen border(hot ? Fade(kBlue, 1) : Color(40, 255, 255, 255), hot ? 2 * s : 1 * s);
-        g.DrawPath(&border, &p);
-        spotLocal.push_back(RECT{(LONG)x, 0, (LONG)(x + sw), H});
-        if (ca < 0.05f) continue;
-        float pad = 12 * s, d = 32 * s, cy = H / 2.f;
-        SolidBrush ib(Fade(hot ? kBlue : kGrayBtn, ca));
-        g.FillEllipse(&ib, x + pad, cy - d / 2, d, d);
-        wchar_t gs[2] = {kGlyphPhone, 0};
-        SolidBrush wb(Fade(0xFFFFFFFF, ca));
-        g.DrawString(gs, 1, F.icon.get(), RectF(x + pad, cy - d / 2, d, d), &cf, &wb);
-        float tx = x + pad + d + 10 * s, tw = max(10.f, sw - (tx - x) - pad);
-        SolidBrush gray(Fade(0xFFB4B4B4, ca));
-        g.DrawString(look_.spots[i].c_str(), -1, F.title.get(), RectF(tx, cy - 20 * s, tw, 20 * s), &tf, &wb);
-        const wchar_t* sub = hot ? L"Release to send" : L"Drop here";
-        g.DrawString(sub, -1, F.sub.get(), RectF(tx, cy + 1 * s, tw, 18 * s), &tf, &gray);
-      }
-    } else {
     GraphicsPath pill;
     AddRoundRect(pill, 0.5f, 0.5f, W - 1.f, H - 1.f, min(H / 2.f, 30 * s));
     SolidBrush bg(Fade(kBg, 1));
@@ -752,8 +864,11 @@ void TopOverlay::Render() {
     float ca = look_.h > 30 ? (ch_ - 30) / (look_.h - 30) : 0;
     ca = std::clamp(ca, 0.f, 1.f);
     ca *= std::clamp((cw_ - look_.w * 0.6f) / (look_.w * 0.4f), 0.f, 1.f);
+    ca *= std::clamp((GetTickCount64() - fadeAt_) / (float)kFadeMs, 0.f, 1.f);
     for (auto& b : look_.buttons) b.rc = RECT{};
-    if (ca > 0.05f && !look_.idle) {
+    if (ca > 0.05f && !look_.idle && (look_.stack || look_.expanded)) {
+      DrawTall(g, W, H, s, ca, px, py);
+    } else if (ca > 0.05f && !look_.idle) {
       auto& F = FontsFor(s);
       float pad = 14 * s;
       float cy = H / 2.f;
@@ -780,7 +895,7 @@ void TopOverlay::Render() {
         auto& b = look_.buttons[i];
         RectF m;
         g.MeasureString(b.label.c_str(), -1, F.btn.get(), PointF(0, 0), &m);
-        float bw = m.Width + 28 * s, bh = 32 * s;
+        float bw = b.icon ? 36 * s : m.Width + 28 * s, bh = b.icon ? 36 * s : 32 * s;
         RectF r(right - bw, cy - bh / 2, bw, bh);
         GraphicsPath bp;
         AddRoundRect(bp, r.X, r.Y, r.Width, r.Height, bh / 2);
@@ -789,7 +904,12 @@ void TopOverlay::Render() {
         SolidBrush fb(Fade(fill, ca));
         g.FillPath(&fb, &bp);
         SolidBrush tb(Fade(0xFFFFFFFF, ca));
-        g.DrawString(b.label.c_str(), -1, F.btn.get(), r, &bf, &tb);
+        if (b.icon) {
+          wchar_t gs[2] = {b.icon, 0};
+          g.DrawString(gs, 1, F.icon.get(), r, &bf, &tb);
+        } else {
+          g.DrawString(b.label.c_str(), -1, F.btn.get(), r, &bf, &tb);
+        }
         b.rc = RECT{(LONG)r.X + px, (LONG)r.Y + py, (LONG)(r.X + r.Width) + px, (LONG)(r.Y + r.Height) + py};
         right -= bw + 8 * s;
       }
@@ -834,16 +954,12 @@ void TopOverlay::Render() {
         g.DrawString(look_.sub.c_str(), -1, F.sub.get(), RectF(tx, cy + 1 * s, tw, 18 * s), &tf, &gray);
       }
     }
-    }  // single pill
   }
 
   MONITORINFO mi{sizeof mi};
   GetMonitorInfoW(monitor_, &mi);
   POINT dst{mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left - WW) / 2,
             mi.rcMonitor.top + (band ? 0 : (LONG)std::lround(cy_ * s))};
-  spotRects_.clear();
-  for (auto r : spotLocal)
-    spotRects_.push_back(RECT{r.left + px + dst.x, r.top + py + dst.y, r.right + px + dst.x, r.bottom + py + dst.y});
   SIZE sz{WW, WH};
   POINT src{0, 0};
   BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};

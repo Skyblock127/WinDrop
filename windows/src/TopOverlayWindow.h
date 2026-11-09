@@ -2,6 +2,8 @@
 #include "NetworkEngine.h"
 #include "common.h"
 
+namespace Gdiplus { class Graphics; }
+
 namespace td {
 
 class DropTarget;
@@ -18,10 +20,11 @@ class TopOverlay {
   void SetPillShown(bool on);
   void OnNetEvent(const UiEvent& e);
   void Notify(const std::wstring& title, const std::wstring& sub, bool warn = false);
-
+  // Sends a drop or the clipboard: straight to the one paired phone, else the pill asks where to
+  // (paired phones and nearby ones, kept up to date while it asks).
+  void Send(const std::vector<std::wstring>& files, const std::wstring& text);
   // Called by DropTarget.
   void DragEntered();
-  void DragMoved(POINT screenPt);
   void DragLeft();
   void Dropped(const std::vector<std::wstring>& files, const std::wstring& text);
 
@@ -30,6 +33,7 @@ class TopOverlay {
     std::wstring label;
     int id;
     uint32_t fill;
+    wchar_t icon = 0;  // round icon-only button (accept / decline) instead of a label
     RECT rc{};
   };
   struct Look {
@@ -42,8 +46,9 @@ class TopOverlay {
     bool highlight = false;
     bool clickable = false;
     std::vector<Btn> buttons;
-    std::vector<std::wstring> spots;  // 2+ phones paired: one drop spot per phone instead of the pill
-    int hot = -1;                     // the spot under the cursor
+    bool stack = false;     // buttons as full-width rows under the title (the "send to which phone" list)
+    bool expanded = false;  // tall: the whole title wrapped, buttons in a row underneath
+    float titleH = 0;       // expanded: height of the wrapped title, DIPs
   };
   struct Message {
     bool active = false;
@@ -60,6 +65,7 @@ class TopOverlay {
   void Refresh();
   void Tick();
   void Render();
+  void DrawTall(Gdiplus::Graphics& g, int W, int H, float s, float ca, int px, int py);
   void PollDrag();
   void ShowMessage(Message m, UINT ms);
   void OnButton(int id);
@@ -87,11 +93,21 @@ class TopOverlay {
   Look look_;
 
   int drag_ = 0;  // 0 none, 1 hint, 2 hovering the pill
-  std::vector<std::string> spotPhones_;  // phone ids of the drop spots, left to right
-  std::vector<RECT> spotRects_;          // their last drawn bounds, screen coordinates
-  int hotSpot_ = -1;
-  int SpotAt(POINT screenPt) const;
   float BandW() const;
+  void Deliver(const std::string& phone, const std::vector<std::wstring>& files, const std::wstring& text);
+  std::vector<std::string> Targets() const;  // paired phones (default first), then nearby ones
+  void UpdateChooser();
+  struct {
+    bool active = false;
+    std::vector<std::wstring> files;
+    std::wstring text, what;
+    std::vector<std::string> ids;  // the rows, top to bottom
+    ULONGLONG until = 0;
+  } choose_;
+  bool offerExpanded_ = false;  // the offer pill was clicked: show the whole name
+  // Content fades in when the pill's content changes (the size animates on its own).
+  std::wstring fadeKey_;
+  ULONGLONG fadeAt_ = 0;
   bool oleInside_ = false;
   bool wasDown_ = false;
   POINT pressPt_{};

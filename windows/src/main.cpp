@@ -289,9 +289,7 @@ void SendClipboard() {
   std::wstring text;
   if (DropTarget::Extract(data, &files, &text)) {
     Log("ui: send clipboard (%zu files)", files.size());
-    if (!files.empty()) gNet.SendFiles(files);
-    else gNet.SendText(W2U(text));
-    gOverlay.Notify(L"Sending clipboard to " + PhoneLabel(std::string()) + L"…", files.empty() ? L"Text" : std::to_wstring(files.size()) + L" file(s)");
+    gOverlay.Send(files, text);  // the pill says where it goes, or asks
   } else {
     gOverlay.Notify(L"Clipboard is empty", L"Copy some text or files first", true);
   }
@@ -443,7 +441,9 @@ void ShowMenu() {
   bool on = Cfg().enabled;
   HMENU m = CreatePopupMenu();
   std::wstring pairing = PairingLeft();
-  std::wstring status = on ? PhonesLine() + L"  ·  link: " + TheWifiDirect().Status() + (pairing.empty() ? L"" : L"  ·  pairing open, " + pairing)
+  ULONGLONG vis = TheWifiDirect().VisibleLeftMs();
+  std::wstring status = on ? PhonesLine() + L"  ·  link: " + TheWifiDirect().Status() + (pairing.empty() ? L"" : L"  ·  pairing open, " + pairing) +
+                                 (vis ? L"  ·  nearby phones can send (" + std::to_wstring((vis + 59999) / 60000) + L" min)" : L"")
                            : L"WinDrop is off";
   AppendMenuW(m, MF_STRING | MF_GRAYED, IDM_STATUS, status.c_str());
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);

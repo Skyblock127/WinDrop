@@ -276,6 +276,7 @@ void NetworkEngine::SenderLoop() {
       queue_.pop_front();
     }
     std::wstring name = job.isText ? L"Text" : FileNameOf(job.path);
+    failReason_.clear();
     Result r = SendOne(job);
     Log("send %s -> %d", W2U(name).c_str(), (int)r);
 
@@ -343,6 +344,7 @@ void NetworkEngine::SenderLoop() {
       } else {
         auto* e = new UiEvent{NetEv::Failed};
         e->name = r == Result::Missing ? name + L" (file not found)" : name;
+        e->text = failReason_;
         Post(e);
       }
     }
@@ -424,7 +426,11 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
   SOCKET s = INVALID_SOCKET;
   if (nearby) {
     s = CallNearby(job.phoneId, &ip);
-    if (s == INVALID_SOCKET) { Log("send: %s didn't answer", W2U(PhoneLabel(job.phoneId)).c_str()); return Result::Failed; }
+    if (s == INVALID_SOCKET) {
+      Log("send: %s didn't answer", W2U(PhoneLabel(job.phoneId)).c_str());
+      failReason_ = W2U(PhoneLabel(job.phoneId)) + " didn't answer";
+      return Result::Failed;
+    }
   } else {
     s = ConnectPeer(&ip);
     // A fresh Wi-Fi Direct link takes the phone a second or so to finish its side (DHCP, server).
@@ -452,6 +458,7 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
     int st = OpenClient(s, Cfg().deviceId, myName, &op);
     if (st != 1) {
       Log("send: %s %s", W2U(PhoneLabel(job.phoneId)).c_str(), st == 0 ? "isn't taking files from nearby PCs any more" : "broke off");
+      failReason_ = W2U(PhoneLabel(job.phoneId)) + (st == 0 ? " stopped taking files from nearby PCs" : " broke off");
       return Result::Failed;
     }
     key = op.key;
@@ -493,7 +500,13 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
   if (!ch.Send(hdr.data(), hdr.size())) return Result::Offline;
 
   uint8_t d = 0;
-  if (nearby) SetTimeouts(s, 75000);  // its user has a minute to accept
+  if (nearby) {
+    SetTimeouts(s, 75000);  // its user has a minute to accept
+    auto* w = new UiEvent{NetEv::Waiting};
+    w->phone = job.phoneId;
+    w->name = name;
+    Post(w);
+  }
   if (!ch.Recv(&d, 1)) { Log("no decision: %d", WSAGetLastError()); return Result::Failed; }
   if (d == kDeclined) return Result::Declined;
   if (d != kAccepted) return Result::Failed;
