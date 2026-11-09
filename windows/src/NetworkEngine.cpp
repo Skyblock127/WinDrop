@@ -116,7 +116,10 @@ bool NetworkEngine::Start(HWND notify) {
     TheOutbox().AssignPhone(Cfg().DefaultPhone());  // items queued by 0.1.x
   }
   bool ok = !enabled || OpenListener();
-  threads_.emplace_back(&NetworkEngine::SenderLoop, this);
+  // Paired phones are each on their own link, so each gets its own sender: a file for one never
+  // waits behind a file for another.
+  for (size_t i = 0; i < kMaxPhones; ++i) threads_.emplace_back(&NetworkEngine::SenderLoop, this);
+  threads_.emplace_back(&NetworkEngine::NearbyLoop, this);
   threads_.emplace_back(&NetworkEngine::ServerLoop, this);
   threads_.emplace_back(&NetworkEngine::TickerLoop, this);
   Log("Started %s. id=%s, phones paired: %zu", WINDROP_VERSION, Cfg().deviceId.c_str(), Phones().size());
@@ -131,6 +134,7 @@ void NetworkEngine::Stop() {
     listen_ = INVALID_SOCKET;
   }
   qcv_.notify_all();
+  ncv_.notify_all();
   ocv_.notify_all();
   tcv_.notify_all();
   // Transfers in flight may sit in blocking calls; don't hold up exit for them.
@@ -161,14 +165,15 @@ void NetworkEngine::SendFiles(const std::vector<std::wstring>& paths, std::strin
     phoneId = Cfg().DefaultPhone();
   }
   UsedPhone(phoneId);
+  bool nearby = IsNearbyId(phoneId);
   std::lock_guard<std::mutex> lk(qmx_);
   for (auto& p : paths) {
     Job j;
     j.phoneId = phoneId;
     j.path = p;
-    queue_.push_back(j);
+    (nearby ? nearbyQueue_ : queue_).push_back(j);
   }
-  qcv_.notify_one();
+  (nearby ? ncv_ : qcv_).notify_all();
 }
 
 void NetworkEngine::SendText(const std::string& utf8, std::string phoneId) {
@@ -178,13 +183,14 @@ void NetworkEngine::SendText(const std::string& utf8, std::string phoneId) {
     phoneId = Cfg().DefaultPhone();
   }
   UsedPhone(phoneId);
+  bool nearby = IsNearbyId(phoneId);
   std::lock_guard<std::mutex> lk(qmx_);
   Job j;
   j.phoneId = phoneId;
   j.isText = true;
   j.text = utf8;
-  queue_.push_back(j);
-  qcv_.notify_one();
+  (nearby ? nearbyQueue_ : queue_).push_back(j);
+  (nearby ? ncv_ : qcv_).notify_all();
 }
 
 void NetworkEngine::Decide(uint64_t id, bool accept, bool all) {
@@ -223,15 +229,15 @@ bool NetworkEngine::WaitDecision(uint64_t* id, int seconds, std::function<void(u
 void NetworkEngine::CancelOutbox(const std::vector<uint64_t>& ids) {
   for (auto id : ids) TheOutbox().Remove(id);
   std::lock_guard<std::mutex> lk(qmx_);
-  size_t before = queue_.size();
-  queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
-                              [&](const Job& j) {
-                                return j.outboxId && std::find(ids.begin(), ids.end(), j.outboxId) != ids.end();
-                              }),
-               queue_.end());
-  size_t dropped = before - queue_.size();
-  flushLeft_ = flushLeft_ > dropped ? flushLeft_ - dropped : 0;
-  if (!flushLeft_) flushing_ = false;
+  for (auto it = queue_.begin(); it != queue_.end();) {
+    if (it->outboxId && std::find(ids.begin(), ids.end(), it->outboxId) != ids.end()) {
+      auto f = flushLeft_.find(it->phoneId);
+      if (f != flushLeft_.end() && (f->second <= 1 || !--f->second)) flushLeft_.erase(f);
+      it = queue_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void NetworkEngine::OnLinkUp() {
@@ -251,9 +257,8 @@ void NetworkEngine::FlushOutbox(const std::string& phoneId) {
     if (it.phoneId == phoneId) items.push_back(it);
   if (items.empty()) return;
   std::lock_guard<std::mutex> lk(qmx_);
-  if (flushing_) return;
-  flushing_ = true;
-  flushLeft_ = items.size();
+  if (flushLeft_.count(phoneId)) return;  // already on its way
+  flushLeft_[phoneId] = items.size();
   for (auto& it : items) {
     Job j;
     j.phoneId = it.phoneId;
@@ -263,42 +268,47 @@ void NetworkEngine::FlushOutbox(const std::string& phoneId) {
     j.outboxId = it.id;
     queue_.push_back(j);
   }
-  qcv_.notify_one();
+  qcv_.notify_all();
 }
 
+// Paired phones. Several of these run at once, each taking the oldest item for a phone no other
+// one is sending to, so phones are served side by side and each phone's items stay in order. Each
+// phone's items wait in its own outbox: one phone out of reach never holds up another.
 void NetworkEngine::SenderLoop() {
   for (;;) {
     Job job;
     {
       std::unique_lock<std::mutex> lk(qmx_);
-      qcv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
+      auto next = [&] {
+        return std::find_if(queue_.begin(), queue_.end(), [&](const Job& j) {
+          return std::find(sendingTo_.begin(), sendingTo_.end(), j.phoneId) == sendingTo_.end();
+        });
+      };
+      qcv_.wait(lk, [&] { return stop_ || next() != queue_.end(); });
       if (stop_) return;
-      job = std::move(queue_.front());
-      queue_.pop_front();
+      auto it = next();
+      job = std::move(*it);
+      queue_.erase(it);
+      sendingTo_.push_back(job.phoneId);
     }
+    struct Free {  // that phone is free for the next item, however this one ends
+      NetworkEngine* n;
+      std::string phone;
+      ~Free() {
+        {
+          std::lock_guard<std::mutex> lk(n->qmx_);
+          auto& v = n->sendingTo_;
+          v.erase(std::find(v.begin(), v.end(), phone));
+        }
+        n->qcv_.notify_all();
+      }
+    } freeAfter{this, job.phoneId};
     std::wstring name = job.isText ? L"Text" : FileNameOf(job.path);
-    failReason_.clear();
-    Result r = SendOne(job);
+    std::string why;
+    Result r = SendOne(job, &why);
     Log("send %s -> %d", W2U(name).c_str(), (int)r);
 
     bool fromOutbox = job.outboxId != 0;
-    if (IsNearbyId(job.phoneId)) {
-      if (r == Result::Offline) r = Result::Failed;  // not ours to keep trying: no outbox
-      bool more = false;
-      {
-        std::lock_guard<std::mutex> lk(qmx_);
-        for (auto& j : queue_) more = more || j.phoneId == job.phoneId;
-      }
-      if (!more) {
-        bool onLink = false;
-        {
-          std::lock_guard<std::mutex> lk(tmx_);
-          onLink = nearbyOnLink_ == job.phoneId && nearbyLinkSeq_ == TheWifiDirect().LinkSeq();
-          nearbyOnLink_.clear();
-        }
-        if (onLink) TheWifiDirect().Disconnect();  // done with that phone: free the link
-      }
-    }
     if (r == Result::Offline && !fromOutbox) {
       OutboxItem it;
       it.phoneId = job.phoneId;
@@ -308,12 +318,12 @@ void NetworkEngine::SenderLoop() {
       auto* e = new UiEvent{NetEv::Offline};
       e->phone = job.phoneId;
       e->id = TheOutbox().Add(it);
-      if (enabled && TheWifiDirect().PeerIp().empty()) {
-        // Call it now, not on the next tick, unless the ticker would hold the call back anyway: Wi-Fi
-        // off, or pairing holding the beacon (see TickerLoop).
-        if (TheRadios().WifiOn() && !TheWifiDirect().Pairing())
-          TheWifiDirect().SetBeacon(WifiDirectHost::kBeaconPending, job.phoneId);
+      if (enabled && TheWifiDirect().IpOf(job.phoneId).empty()) {
         std::lock_guard<std::mutex> lk(tmx_);
+        // Call it now, not on the next tick, unless the ticker would hold the call back anyway: Wi-Fi
+        // off, pairing holding the beacon, or a nearby phone being called (see TickerLoop).
+        if (TheRadios().WifiOn() && !TheWifiDirect().Pairing() && calling_.empty())
+          TheWifiDirect().SetBeacon(WifiDirectHost::kBeaconPending, job.phoneId);
         if (waking_.empty()) { waking_ = job.phoneId; wakingSince_ = GetTickCount64(); }
       }
       e->count = 0;  // waiting for this phone only; other phones have their own queues
@@ -323,42 +333,148 @@ void NetworkEngine::SenderLoop() {
       std::lock_guard<std::mutex> lk(tmx_);
       nextProbe_ = GetTickCount64() + backoffSec_ * 1000ull;
     } else if (r == Result::Offline) {
-      // Still unreachable: leave the rest of the outbox for the next probe.
+      // Still unreachable: leave the rest of that phone's outbox for a few seconds (other phones' go on).
       std::lock_guard<std::mutex> lk(qmx_);
-      queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const Job& j) { return j.outboxId != 0; }),
+      queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+                                  [&](const Job& j) { return j.outboxId != 0 && j.phoneId == job.phoneId; }),
                    queue_.end());
-      flushing_ = false;
-      flushLeft_ = 0;
+      flushLeft_.erase(job.phoneId);
+      flushAfter_[job.phoneId] = GetTickCount64() + 5000;
       continue;
     } else {
       if (fromOutbox && r != Result::Failed) TheOutbox().Remove(job.outboxId);
-      if (r == Result::Ok) {
-        auto* e = new UiEvent{NetEv::SendDone};
-        e->phone = job.phoneId;
-        e->name = name;
-        Post(e);
-      } else if (r == Result::Declined) {
-        auto* e = new UiEvent{NetEv::Declined};
-        e->phone = job.phoneId;
-        e->name = name;
-        Post(e);
-      } else {
-        auto* e = new UiEvent{NetEv::Failed};
-        e->name = r == Result::Missing ? name + L" (file not found)" : name;
-        e->text = failReason_;
-        Post(e);
+      if (fromOutbox && r == Result::Failed) {  // kept for later: not again at once
+        std::lock_guard<std::mutex> lk(qmx_);
+        flushAfter_[job.phoneId] = GetTickCount64() + 15000;
       }
+      PostResult(job, r, name, why);
     }
     if (fromOutbox) {
       std::lock_guard<std::mutex> lk(qmx_);
-      if (flushLeft_ && --flushLeft_ == 0) flushing_ = false;
+      auto f = flushLeft_.find(job.phoneId);
+      if (f != flushLeft_.end() && (f->second <= 1 || !--f->second)) flushLeft_.erase(f);
     }
   }
 }
 
-// The phone is only ever reached over the Wi-Fi Direct link.
-SOCKET NetworkEngine::ConnectPeer(std::string* usedIp) {
-  std::string ip = TheWifiDirect().PeerIp();
+// Unpaired ("nearby") phones: called over Bluetooth for each drop, nothing kept for later. Runs
+// apart from the paired phones' queue, so calling one (up to 45 s) or waiting for its user to
+// accept (up to a minute) never holds up a paired phone's items, nor the other way round.
+void NetworkEngine::NearbyLoop() {
+  for (;;) {
+    Job job;
+    {
+      std::unique_lock<std::mutex> lk(qmx_);
+      ncv_.wait(lk, [&] { return stop_ || !nearbyQueue_.empty(); });
+      if (stop_) return;
+      job = std::move(nearbyQueue_.front());
+      nearbyQueue_.pop_front();
+    }
+    std::wstring name = job.isText ? L"Text" : FileNameOf(job.path);
+    std::string why;
+    Result r = SendOne(job, &why);
+    Log("send %s -> %d", W2U(name).c_str(), (int)r);
+    if (r == Result::Offline) r = Result::Failed;  // not ours to keep trying: no outbox
+    bool more = false;
+    {
+      std::lock_guard<std::mutex> lk(qmx_);
+      for (auto& j : nearbyQueue_) more = more || j.phoneId == job.phoneId;
+    }
+    if (!more) {
+      std::string ip;
+      {
+        std::lock_guard<std::mutex> lk(tmx_);
+        if (nearbyOnLink_ == job.phoneId) ip = nearbyIp_;
+        nearbyOnLink_.clear();
+        nearbyIp_.clear();
+      }
+      if (!ip.empty() && TheWifiDirect().HasPeer(ip)) TheWifiDirect().Disconnect(ip);  // done with that phone
+    }
+    PostResult(job, r, name, why);
+  }
+}
+
+void NetworkEngine::PostResult(const Job& job, Result r, const std::wstring& name, const std::string& why) {
+  if (r == Result::Ok) {
+    auto* e = new UiEvent{NetEv::SendDone};
+    e->phone = job.phoneId;
+    e->name = name;
+    Post(e);
+  } else if (r == Result::Declined) {
+    auto* e = new UiEvent{NetEv::Declined};
+    e->phone = job.phoneId;
+    e->name = name;
+    Post(e);
+  } else {
+    auto* e = new UiEvent{NetEv::Failed};
+    e->name = r == Result::Missing ? name + L" (file not found)" : name;
+    e->text = why;
+    Post(e);
+  }
+}
+
+// One transfer's part of the overlay's progress: transfers running at once add up.
+struct Progress {
+  NetworkEngine& n;
+  std::shared_ptr<NetworkEngine::Live> t = std::make_shared<NetworkEngine::Live>();
+  Progress(NetworkEngine& net, uint64_t size, bool sending, const std::wstring& name, const std::string& phoneId,
+           const std::wstring& phone)
+      : n(net) {
+    t->sending = sending;
+    t->name = name;
+    t->phone = phone;
+    t->phoneId = phoneId;
+    t->total = size;
+    n.xferTotal += size;
+    n.Began(t);
+  }
+  void Add(uint64_t k) {
+    t->done += k;
+    n.xferDone += k;
+  }
+  ~Progress() {
+    n.xferDone -= t->done;
+    n.xferTotal -= t->total;
+    n.Ended(t);
+  }
+};
+
+void NetworkEngine::Began(const std::shared_ptr<Live>& t) {
+  std::lock_guard<std::mutex> lk(pmx_);
+  running_.push_back(t);
+  (t->sending ? sendingNow : receivingNow)++;
+  lastActive_[t->phoneId] = GetTickCount64();
+}
+
+void NetworkEngine::Ended(const std::shared_ptr<Live>& t) {
+  std::lock_guard<std::mutex> lk(pmx_);
+  running_.erase(std::remove(running_.begin(), running_.end(), t), running_.end());
+  (t->sending ? sendingNow : receivingNow)--;
+  lastActive_[t->phoneId] = GetTickCount64();
+}
+
+std::vector<NetworkEngine::Running> NetworkEngine::Transfers() {
+  std::lock_guard<std::mutex> lk(pmx_);
+  std::vector<Running> v;
+  for (auto& t : running_) v.push_back({t->sending, t->name, t->phone, t->done.load(), t->total});
+  return v;
+}
+
+bool NetworkEngine::PhoneIdle(const std::string& phoneId, ULONGLONG now) {
+  {
+    std::lock_guard<std::mutex> lk(pmx_);
+    for (auto& t : running_)
+      if (t->phoneId == phoneId) return false;
+    auto a = lastActive_.find(phoneId);
+    if (a != lastActive_.end() && now < a->second + 10000) return false;
+  }
+  std::lock_guard<std::mutex> lk(qmx_);
+  if (std::find(sendingTo_.begin(), sendingTo_.end(), phoneId) != sendingTo_.end()) return false;
+  return !std::any_of(queue_.begin(), queue_.end(), [&](const Job& j) { return j.phoneId == phoneId; });
+}
+
+// Phones are only ever reached over our Wi-Fi Direct group.
+SOCKET NetworkEngine::ConnectTo(const std::string& ip) {
   if (ip.empty()) return INVALID_SOCKET;
   sockaddr_in a{};
   a.sin_family = AF_INET;
@@ -385,19 +501,14 @@ SOCKET NetworkEngine::ConnectPeer(std::string* usedIp) {
   if (!ok) { closesocket(s); return INVALID_SOCKET; }
   nb = 0;
   ioctlsocket(s, FIONBIO, &nb);
-  *usedIp = ip;
   return s;
 }
 
-NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
+NetworkEngine::Result NetworkEngine::SendOne(const Job& job, std::string* why) {
   if (!enabled) return Result::Offline;
   bool nearby = IsNearbyId(job.phoneId);
   Bytes key = nearby ? Bytes{} : KeyFor(job.phoneId);
   if (!nearby && key.empty()) { Log("send: that phone isn't paired (any more)"); return Result::Failed; }
-  // One link at a time: if another phone holds it, this waits; the ticker hands the link over
-  // once that phone is idle. (A nearby phone is called right away: an idle link gives way.)
-  std::string linked = TheWifiDirect().LinkedPhone();
-  if (!nearby && !linked.empty() && linked != job.phoneId) return Result::Offline;
   uint64_t size = 0;
   HANDLE f = INVALID_HANDLE_VALUE;
   std::wstring name = L"text.txt";
@@ -425,68 +536,104 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
   } stranger{nearby};
   std::string ip;
   SOCKET s = INVALID_SOCKET;
-  if (nearby) {
-    s = CallNearby(job.phoneId, &ip);
-    if (s == INVALID_SOCKET) {
-      Log("send: %s didn't answer", W2U(PhoneLabel(job.phoneId)).c_str());
-      failReason_ = W2U(PhoneLabel(job.phoneId)) + " didn't answer";
-      return Result::Failed;
-    }
-  } else {
-    s = ConnectPeer(&ip);
-    // A fresh Wi-Fi Direct link takes the phone a second or so to finish its side (DHCP, server).
-    for (int i = 0; s == INVALID_SOCKET && i < 8 && !TheWifiDirect().PeerIp().empty(); ++i) {
-      Sleep(400);
-      s = ConnectPeer(&ip);
-    }
-    if (s == INVALID_SOCKET) { Log("send: phone not reachable yet"); return Result::Offline; }
-  }
   SecureChannel ch;
-  ch.s = s;
-  struct SockCloser {
-    SOCKET s;
-    ~SockCloser() { closesocket(s); }
-  } sc{s};
-
-  SetTimeouts(s, 10000);
+  PeerVersion peer;
+  std::string label = W2U(PhoneLabel(job.phoneId));
   if (nearby) {
     std::string myName;
     {
       std::lock_guard<std::recursive_mutex> lk(CfgMutex());
       myName = W2U(Cfg().deviceName);
     }
-    OpenPeer op;
-    int st = OpenClient(s, Cfg().deviceId, myName, &op);
-    if (st != 1) {
-      Log("send: %s %s", W2U(PhoneLabel(job.phoneId)).c_str(), st == 0 ? "isn't taking files from nearby PCs any more" : "broke off");
-      failReason_ = W2U(PhoneLabel(job.phoneId)) + (st == 0 ? " stopped taking files from nearby PCs" : " broke off");
+    Bytes want = NearbyTag(job.phoneId);
+    ULONGLONG until = GetTickCount64() + 45000;
+    std::vector<uint64_t> tried;
+    for (int wrong = 0;;) {
+      s = CallNearby(job.phoneId, &ip, until, tried);
+      if (s == INVALID_SOCKET) {
+        Log("send: %s didn't answer", label.c_str());
+        *why = label + " didn't answer";
+        return Result::Failed;
+      }
+      SetTimeouts(s, 10000);
+      OpenPeer op;
+      int st = OpenClient(s, Cfg().deviceId, myName, &op);
+      if (st == 1 && NearbyTagFor(op.id) == want) {
+        key = op.key;
+        break;
+      }
+      closesocket(s);
+      s = INVALID_SOCKET;
+      // That link was another phone's (a paired one, say): keep calling ours. A refusal while ours
+      // still says it takes files was most likely that other phone too.
+      auto around = NearbyPhones();
+      bool heard = std::any_of(around.begin(), around.end(), [&](const NearbyPhone& n) { return n.id == job.phoneId; });
+      if ((st == 1 || (st == 0 && heard)) && ++wrong <= 3 && GetTickCount64() < until) {
+        Log("send: the phone at %s isn't %s; still calling it", ip.c_str(), label.c_str());
+        continue;
+      }
+      Log("send: %s %s", label.c_str(), st == 0 ? "isn't taking files from nearby PCs any more" : "broke off");
+      *why = label + (st == 0 ? " stopped taking files from nearby PCs" : " broke off");
       return Result::Failed;
     }
-    key = op.key;
-  }
-  PeerVersion peer;
-  auto hs = ch.ClientHandshake(key, Cfg().deviceId, &peer);
-  if (hs == SecureChannel::kIncompatible) {
-    Log("send: phone app %s (protocol %d) doesn't match ours (%d)", peer.version.c_str(), peer.proto, kProto);
-    PostIncompatible(peer);
-    return Result::Failed;
-  }
-  if (hs == SecureChannel::kRefused) {
-    // Another paired phone holds the link (it doesn't know this phone's key): wait our turn.
-    Log("send: the phone on the link isn't %s", W2U(PhoneLabel(job.phoneId)).c_str());
-    return Result::Offline;
-  }
-  if (hs != SecureChannel::kOk) {
-    Log("send: phone at %s failed the pairing check", ip.c_str());
-    return Result::Failed;
-  }
-  if (nearby) {
+    ch.s = s;
+    auto hs = ch.ClientHandshake(key, Cfg().deviceId, &peer);
+    if (hs != SecureChannel::kOk) {
+      closesocket(s);
+      if (hs == SecureChannel::kIncompatible) {
+        Log("send: phone app %s (protocol %d) doesn't match ours (%d)", peer.version.c_str(), peer.proto, kProto);
+        PostIncompatible(peer);
+      } else {
+        Log("send: %s broke off", label.c_str());
+        *why = label + " broke off";
+      }
+      return Result::Failed;
+    }
     std::lock_guard<std::mutex> lk(tmx_);
     nearbyOnLink_ = job.phoneId;
-    nearbyLinkSeq_ = TheWifiDirect().LinkSeq();
+    nearbyIp_ = ip;
   } else {
+    // Its own link once it has proven itself on one; until then the links that haven't said who
+    // they are yet (it may have only just come up), newest first. Another phone there turns our
+    // key away, and the next one is tried.
+    std::string known = TheWifiDirect().IpOf(job.phoneId);
+    std::vector<std::string> ips = known.empty() ? TheWifiDirect().UnprovenIps() : std::vector<std::string>{known};
+    bool others = false;
+    for (auto& cand : ips) {
+      SOCKET c = ConnectTo(cand);
+      // A fresh Wi-Fi Direct link takes the phone a second or so to finish its side (DHCP, server).
+      for (int i = 0; c == INVALID_SOCKET && i < 8 && TheWifiDirect().FreshLink(cand); ++i) {
+        Sleep(400);
+        c = ConnectTo(cand);
+      }
+      if (c == INVALID_SOCKET) continue;
+      SetTimeouts(c, 10000);
+      ch.s = c;
+      auto hs = ch.ClientHandshake(key, Cfg().deviceId, &peer);
+      if (hs == SecureChannel::kOk) {
+        s = c;
+        ip = cand;
+        break;
+      }
+      closesocket(c);
+      ch.s = INVALID_SOCKET;
+      if (hs == SecureChannel::kIncompatible) {
+        Log("send: phone app %s (protocol %d) doesn't match ours (%d)", peer.version.c_str(), peer.proto, kProto);
+        PostIncompatible(peer);
+        return Result::Failed;
+      }
+      others = others || hs == SecureChannel::kRefused;
+    }
+    if (s == INVALID_SOCKET) {
+      Log(others ? "send: %s isn't on the link yet (another phone is)" : "send: %s not reachable yet", label.c_str());
+      return Result::Offline;
+    }
     TheWifiDirect().MarkAuthenticated(job.phoneId, ip);
   }
+  struct SockCloser {
+    SOCKET s;
+    ~SockCloser() { closesocket(s); }
+  } sc{s};
   BusyLink busy;
   struct Done {
     std::atomic<ULONGLONG>& t;
@@ -517,15 +664,13 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
   e->size = size;
   e->count = job.outboxId ? 1 : 0;
   Post(e);
-  xferTotal = size;
-  xferDone = 0;
-  xferDir = 1;
+  Progress prog(*this, size, true, job.isText ? L"Text" : name, job.phoneId, PhoneLabel(job.phoneId));
 
   SetTimeouts(s, 30000);
   bool ok = true;
   if (job.isText) {
     ok = ch.Send(job.text.data(), job.text.size());
-    xferDone = size;
+    prog.Add(size);
   } else {
     std::vector<char> buf(kChunk);
     uint64_t left = size;
@@ -534,12 +679,11 @@ NetworkEngine::Result NetworkEngine::SendOne(const Job& job) {
       if (!ReadFile(f, buf.data(), (DWORD)std::min<uint64_t>(left, kChunk), &got, nullptr) || got == 0) { ok = false; break; }
       ok = ch.Send(buf.data(), got);
       left -= got;
-      xferDone += got;
+      prog.Add(got);
     }
   }
   uint8_t ack = kAckBad;
   if (ok) ok = ch.Recv(&ack, 1);
-  xferDir = 0;
   return ok && ack == kAckOk ? Result::Ok : Result::Failed;
 }
 
@@ -612,7 +756,7 @@ void NetworkEngine::HandleIncoming(SOCKET c, const std::string& ip) {
     Log("refused a connection from %s: not a paired phone", ip.c_str());
     // A phone this PC no longer has (removed, or paired with another PC) holding the link would
     // keep the paired phones off it: drop it now and ignore its requests for a while.
-    if (ip == TheWifiDirect().PeerIp() && TheWifiDirect().LinkedPhone().empty()) TheWifiDirect().RejectPeer();
+    if (TheWifiDirect().IsUnproven(ip)) TheWifiDirect().RejectPeer(ip);
     return;
   }
   TheWifiDirect().MarkAuthenticated(peerId, ip);
@@ -648,8 +792,8 @@ void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip, cons
     uint8_t ok = kAckOk;
     ch.Send(&ok, 1);
     ch.Flush();
-    Log("phone is closing the link");
-    TheWifiDirect().Disconnect();
+    Log("phone is closing the link (%s)", ip.c_str());
+    TheWifiDirect().Disconnect(ip);
     return;
   }
   if (type != kTypeFile && type != kTypeText) { uint8_t b = kBusy; ch.Send(&b, 1); ch.Flush(); return; }
@@ -659,7 +803,7 @@ void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip, cons
   std::wstring wname = SanitizeName(U2W(name));
   if (stranger) {
     // Unpaired: nothing proves who this is, so the user decides.
-    bool yes = AskOffer(type == kTypeText ? L"text" : wname, size, *stranger, phoneId);
+    bool yes = AskOffer(type == kTypeText ? L"text" : wname, size, *stranger, phoneId, ch.s);
     uint8_t d = yes ? kAccepted : kDeclined;
     if (!ch.Send(&d, 1) || !ch.Flush() || !yes) {
       Log("offer from %s %s", W2U(*stranger).c_str(), yes ? "broke off" : "declined");
@@ -690,6 +834,7 @@ void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip, cons
     if (ok) {
       auto* e = new UiEvent{NetEv::TextReceived};
       e->text = text;
+      e->name = stranger ? *stranger : PhoneLabel(phoneId);  // which phone it came from
       Post(e);
     }
     return;
@@ -709,23 +854,22 @@ void NetworkEngine::HandleSession(SecureChannel& ch, const std::string& ip, cons
   e->name = wname;
   e->size = size;
   Post(e);
-  xferTotal = size;
-  xferDone = 0;
-  xferDir = 2;
 
   std::vector<char> buf(kChunk);
   uint64_t left = size;
   bool ok = true;
-  while (left) {
-    size_t n = (size_t)std::min<uint64_t>(left, kChunk);
-    if (!ch.Recv(buf.data(), n)) { ok = false; break; }
-    DWORD wrote = 0;
-    if (!WriteFile(f, buf.data(), (DWORD)n, &wrote, nullptr) || wrote != (DWORD)n) { ok = false; break; }
-    left -= n;
-    xferDone += n;
+  {
+    Progress prog(*this, size, false, wname, phoneId, stranger ? *stranger : PhoneLabel(phoneId));
+    while (left) {
+      size_t n = (size_t)std::min<uint64_t>(left, kChunk);
+      if (!ch.Recv(buf.data(), n)) { ok = false; break; }
+      DWORD wrote = 0;
+      if (!WriteFile(f, buf.data(), (DWORD)n, &wrote, nullptr) || wrote != (DWORD)n) { ok = false; break; }
+      left -= n;
+      prog.Add(n);
+    }
   }
   CloseHandle(f);
-  xferDir = 0;
   uint8_t ack = ok ? kAckOk : kAckBad;
   ch.Send(&ack, 1);
   ch.Flush();
@@ -859,7 +1003,7 @@ void NetworkEngine::HandlePair(SOCKET c, const std::string& ip) {
 
 // An unpaired phone wants to send: only while "visible to nearby phones" is on.
 void NetworkEngine::HandleOpen(SOCKET c, const std::string& ip) {
-  if (!TheWifiDirect().Visible()) {
+  if (!TheWifiDirect().VisibleOrJustEnded()) {
     Log("nearby: refused %s: not visible to nearby phones", ip.c_str());
     uint8_t no = kStatusRefused;
     SendRaw(c, &no, 1);
@@ -892,9 +1036,21 @@ void NetworkEngine::HandleOpen(SOCKET c, const std::string& ip) {
   lastActivity_ = GetTickCount64();
 }
 
+// The other side closed the connection (or it broke): readable, with nothing to read.
+static bool HungUp(SOCKET s) {
+  fd_set r;
+  FD_ZERO(&r);
+  FD_SET(s, &r);
+  timeval tv{0, 0};
+  if (select(0, &r, nullptr, nullptr, &tv) <= 0) return false;
+  char b;
+  return recv(s, &b, 1, MSG_PEEK) <= 0;
+}
+
 // The pill asks; false on decline or after a minute. After "accept all" / "decline all", that
 // sender's next offers get the same answer without asking, until it goes quiet for 2 minutes.
-bool NetworkEngine::AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from, const std::string& fromId) {
+bool NetworkEngine::AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from, const std::string& fromId,
+                             SOCKET s) {
   constexpr ULONGLONG kAutoMs = 120000;
   uint64_t id;
   {
@@ -917,46 +1073,65 @@ bool NetworkEngine::AskOffer(const std::wstring& name, uint64_t size, const std:
   e->size = size;
   e->path = from;
   Post(e);
-  bool yes;
+  bool yes, gone = false;
   {
     std::unique_lock<std::mutex> lk(omx_);
-    ocv_.wait_for(lk, std::chrono::seconds(60), [&] { return offers_[id] >= 0 || stop_; });
-    yes = offers_[id] == 1;
+    ULONGLONG until = GetTickCount64() + kOfferWaitSec * 1000ull;
+    while (!stop_ && GetTickCount64() < until) {
+      if (ocv_.wait_for(lk, std::chrono::milliseconds(500), [&] { return offers_[id] >= 0 || stop_; })) break;
+      lk.unlock();
+      gone = HungUp(s);  // the phone gave up (or went out of range): don't keep asking
+      lk.lock();
+      if (gone) break;
+    }
+    yes = !gone && offers_[id] == 1;
     offers_.erase(id);
-    if (offerAll_.erase(id)) autoAnswer_[fromId] = {yes, GetTickCount64() + kAutoMs};
+    if (offerAll_.erase(id) && !gone) autoAnswer_[fromId] = {yes, GetTickCount64() + kAutoMs};
   }
+  if (gone) Log("nearby: %s took back %s", W2U(from).c_str(), W2U(name).c_str());
   auto* closed = new UiEvent{NetEv::OfferClosed};
   closed->id = id;
   Post(closed);
   return yes;
 }
 
-// Calls the nearby phone over Bluetooth until it joins (or 45 s pass), then connects to it.
-// Another phone's idle link gives way when this one asks to join.
-SOCKET NetworkEngine::CallNearby(const std::string& phoneId, std::string* ip) {
+// Calls the nearby phone over Bluetooth until a link that may be it comes up (or the time is up),
+// then connects to it. Links that haven't proven to be a paired phone are tried newest first, each
+// once (`tried`); the caller checks who answered. One already on our group counts too.
+SOCKET NetworkEngine::CallNearby(const std::string& phoneId, std::string* ip, ULONGLONG& until,
+                                 std::vector<uint64_t>& tried) {
   auto& wfd = TheWifiDirect();
+  std::string known;
   {
     std::lock_guard<std::mutex> lk(tmx_);
-    // Already on the link (an earlier item of the same drop): use it.
-    if (nearbyOnLink_ == phoneId && nearbyLinkSeq_ == wfd.LinkSeq() && !wfd.PeerIp().empty()) return ConnectPeer(ip);
+    if (nearbyOnLink_ == phoneId) known = nearbyIp_;  // an earlier item of the same drop
     calling_ = phoneId;
   }
   tcv_.notify_all();
-  Log("nearby: calling %s", W2U(PhoneLabel(phoneId)).c_str());
-  uint64_t seq0 = wfd.LinkSeq();
   SOCKET s = INVALID_SOCKET;
-  ULONGLONG until = GetTickCount64() + 45000;
+  if (!known.empty() && wfd.HasPeer(known)) {
+    s = ConnectTo(known);
+    if (s != INVALID_SOCKET) *ip = known;
+  }
+  if (s == INVALID_SOCKET) Log("nearby: calling %s", W2U(PhoneLabel(phoneId)).c_str());
   while (s == INVALID_SOCKET && GetTickCount64() < until && enabled && !stop_) {
-    if (wfd.LinkSeq() != seq0 && !wfd.PeerIp().empty()) {
-      s = ConnectPeer(ip);
-      for (int i = 0; s == INVALID_SOCKET && i < 10 && !wfd.PeerIp().empty(); ++i) {
-        Sleep(400);
-        s = ConnectPeer(ip);
+    std::string cand;
+    for (auto& [seq, lip] : wfd.UnprovenLinks())
+      if (std::find(tried.begin(), tried.end(), seq) == tried.end()) {
+        tried.push_back(seq);
+        cand = lip;
+        break;
       }
-      if (s == INVALID_SOCKET) seq0 = wfd.LinkSeq();  // that link wasn't it: keep calling
-    } else {
+    if (cand.empty()) {
       Sleep(300);
+      continue;
     }
+    s = ConnectTo(cand);
+    for (int i = 0; s == INVALID_SOCKET && i < 10 && wfd.FreshLink(cand); ++i) {
+      Sleep(400);
+      s = ConnectTo(cand);
+    }
+    if (s != INVALID_SOCKET) *ip = cand;
   }
   std::lock_guard<std::mutex> lk(tmx_);
   calling_.clear();
@@ -971,23 +1146,23 @@ void NetworkEngine::TickerLoop() {
     ULONGLONG now = GetTickCount64();
     bool probe = false;
     auto& wfd = TheWifiDirect();
-    bool linkUp = !wfd.PeerIp().empty();
-    std::string linked = wfd.LinkedPhone();
-
-    // Phones with something waiting, oldest item first; a drag heading for a phone's spot puts
-    // that phone first.
-    std::vector<std::string> waiting;
+    // Several phones can be on our group at once. Phones with something waiting that aren't on it
+    // are called over Bluetooth one at a time, oldest item first (a drag heading for a phone's spot
+    // puts that phone first); if one doesn't come within 30 s, the next is tried.
+    std::vector<std::string> linked = wfd.LinkedPhones();
+    auto isLinked = [&](const std::string& p) { return std::find(linked.begin(), linked.end(), p) != linked.end(); };
+    std::vector<std::string> waiting, linkedWaiting;
     std::string prewarm = wfd.PrewarmPhone();
-    if (!prewarm.empty() && KeyFor(prewarm).size()) waiting.push_back(prewarm);
-    for (auto& it : TheOutbox().Snapshot())
-      if (std::find(waiting.begin(), waiting.end(), it.phoneId) == waiting.end() && KeyFor(it.phoneId).size())
-        waiting.push_back(it.phoneId);
-
-    // No link: call one phone over Bluetooth. If it doesn't come within 30 s, try the next.
-    if (linkUp || waiting.empty()) {
+    if (!prewarm.empty() && KeyFor(prewarm).size() && !isLinked(prewarm)) waiting.push_back(prewarm);
+    for (auto& it : TheOutbox().Snapshot()) {
+      if (KeyFor(it.phoneId).empty()) continue;
+      auto& list = isLinked(it.phoneId) ? linkedWaiting : waiting;
+      if (std::find(list.begin(), list.end(), it.phoneId) == list.end()) list.push_back(it.phoneId);
+    }
+    if (waiting.empty()) {
       waking_.clear();
     } else if (waking_.empty() || std::find(waiting.begin(), waiting.end(), waking_) == waiting.end() ||
-               (!prewarm.empty() && waking_ != prewarm)) {
+               (!prewarm.empty() && waking_ != prewarm && !isLinked(prewarm))) {
       waking_ = waiting.front();
       wakingSince_ = now;
     } else if (now - wakingSince_ > 30000 && waiting.size() > 1) {
@@ -1000,7 +1175,9 @@ void NetworkEngine::TickerLoop() {
     // after 3 minutes, or "Stop pairing"). Taking turns every few seconds looked fairer, but in
     // testing the called phone never caught its turn. With Wi-Fi off here, calling a phone would
     // only have it search for a link that can't come up.
-    bool call = !waking_.empty() && TheRadios().WifiOn();
+    // A nearby phone being called (a send the user just picked) has the air to itself too: two
+    // phones joining at once made both fail in testing. Its call ends within 45 s.
+    bool call = !waking_.empty() && TheRadios().WifiOn() && calling_.empty();
     if (!enabled) wfd.SetBeacon(WifiDirectHost::kBeaconOff);
     else if (wfd.Pairing()) wfd.SetBeacon(WifiDirectHost::kBeaconPresence);
     else if (call) wfd.SetBeacon(WifiDirectHost::kBeaconPending, waking_);
@@ -1013,21 +1190,26 @@ void NetworkEngine::TickerLoop() {
       if (!enabled && wfd.Visible()) wfd.SetVisible(false);
     }
 
-    // A link to a phone with nothing left to do, while another phone waits: hand it over.
-    bool othersWait = std::any_of(waiting.begin(), waiting.end(), [&](const std::string& p) { return p != linked; });
-    bool linkedWaits = false;
-    for (auto& it : TheOutbox().Snapshot()) linkedWaits = linkedWaits || it.phoneId == linked;
-    bool idle = wfd.busy == 0 && now > lastActivity_ + 2000 && prewarm != linked;
-    {
-      std::lock_guard<std::mutex> qlk(qmx_);
-      idle = idle && queue_.empty() && !flushing_;
-    }
-    if (enabled && linkUp && !linked.empty() && othersWait && !linkedWaits && idle && !handingOff_.exchange(true)) {
-      Log("link: %s is done, handing the link to the next phone", W2U(PhoneLabel(linked)).c_str());
-      std::thread([this, linked] {
-        HandOff(linked);
-        handingOff_ = false;
-      }).detach();
+    // A phone we've called for 20 s hasn't come, while others sit idle on the group: some Wi-Fi
+    // cards take only so many phones at once. Ask the one that's been idle to let go (it comes back
+    // by itself when it next needs us). At most every 30 s.
+    if (enabled && !waking_.empty() && now - wakingSince_ > 20000 && now > nextHandOff_ && !linked.empty() &&
+        !handingOff_) {
+      for (auto& p : linked) {
+        if (std::find(linkedWaiting.begin(), linkedWaiting.end(), p) != linkedWaiting.end() || p == prewarm) continue;
+        lk.unlock();
+        bool idle = PhoneIdle(p, now);
+        lk.lock();
+        if (!idle) continue;
+        nextHandOff_ = now + 30000;
+        handingOff_ = true;
+        Log("link: %s hasn't come for 20 s; asking idle %s to let go", W2U(PhoneLabel(waking_)).c_str(), W2U(PhoneLabel(p)).c_str());
+        std::thread([this, p] {
+          HandOff(p);
+          handingOff_ = false;
+        }).detach();
+        break;
+      }
     }
 
     if (TheOutbox().Count() == 0) {
@@ -1039,25 +1221,35 @@ void NetworkEngine::TickerLoop() {
       backoffSec_ = std::min(backoffSec_ * 2, 600);
     }
     lk.unlock();
-    // The phone on the link has things waiting: send them now, not at the next probe.
-    if (enabled && !linked.empty() && (probe || linkedWaits)) FlushOutbox(linked);
+    // Phones on our group with things waiting: send them now (one that just turned us away waits
+    // a few seconds first).
+    if (enabled) {
+      for (auto& p : linkedWaiting) {
+        bool later;
+        {
+          std::lock_guard<std::mutex> qlk(qmx_);
+          auto a = flushAfter_.find(p);
+          later = a != flushAfter_.end() && now < a->second && !probe;
+        }
+        if (!later) FlushOutbox(p);
+      }
+    }
     lk.lock();
   }
 }
 
-// Asks the phone on the link to let it go. Just closing the link isn't enough: a phone that still
-// wanted it reconnects by itself. Phones that don't know the request get their link closed.
+// Asks the phone to let go of its link. Just closing our side isn't enough: a phone that still
+// wanted the link would rejoin by itself. One that's about to send something says no.
 void NetworkEngine::HandOff(const std::string& phoneId) {
-  int answer = -1;
-  std::string ip;
-  SOCKET s = ConnectPeer(&ip);
-  for (int i = 0; s == INVALID_SOCKET && i < 4 && !TheWifiDirect().PeerIp().empty(); ++i) {
-    Sleep(400);  // the phone's Wi-Fi may be dozing between transfers
-    s = ConnectPeer(&ip);
+  std::string ip = TheWifiDirect().IpOf(phoneId);
+  SOCKET s = ConnectTo(ip);
+  if (s == INVALID_SOCKET) {
+    Log("link: couldn't reach %s to ask", W2U(PhoneLabel(phoneId)).c_str());
+    return;
   }
-  if (s == INVALID_SOCKET) Log("link: couldn't reach the phone to ask");
-  if (s != INVALID_SOCKET) {
-    SetTimeouts(s, 5000);
+  int answer = -1;
+  SetTimeouts(s, 5000);
+  {
     SecureChannel ch;
     ch.s = s;
     PeerVersion peer;
@@ -1066,24 +1258,19 @@ void NetworkEngine::HandOff(const std::string& phoneId) {
       std::lock_guard<std::recursive_mutex> lk(CfgMutex());
       me = Cfg().deviceName;
     }
-    auto hs = ch.ClientHandshake(KeyFor(phoneId), Cfg().deviceId, &peer);
-    if (hs == SecureChannel::kOk) {
+    if (ch.ClientHandshake(KeyFor(phoneId), Cfg().deviceId, &peer) == SecureChannel::kOk) {
       std::string hdr = BuildOffer(kTypeRelease, 0, "", W2U(me), Cfg().deviceId);
       uint8_t d = 0;
       if (ch.Send(hdr.data(), hdr.size()) && ch.Recv(&d, 1)) answer = d;
-      else Log("link: no answer from the phone");
-    } else {
-      Log("link: handshake with the phone failed (%d)", (int)hs);
     }
-    closesocket(s);
   }
-  if (answer == kDeclined) {  // it's about to send something: ask again in a few seconds
-    Log("link: %s is still busy, keeping the link", W2U(PhoneLabel(phoneId)).c_str());
-    lastActivity_ = GetTickCount64() + 3000;
+  closesocket(s);
+  if (answer == kDeclined) {
+    Log("link: %s is about to send something, keeping it", W2U(PhoneLabel(phoneId)).c_str());
     return;
   }
-  Log(answer == kAccepted ? "link: the phone let the link go" : "link: closing it (answer %d)", answer);
-  TheWifiDirect().Disconnect();
+  Log(answer == kAccepted ? "link: %s let its link go" : "link: closing %s's link", W2U(PhoneLabel(phoneId)).c_str());
+  TheWifiDirect().Disconnect(ip);
 }
 
 void NetworkEngine::ReceivePhoneLog(SecureChannel& ch, uint64_t size) {

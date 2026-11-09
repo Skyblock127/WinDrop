@@ -122,17 +122,6 @@
             android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
-        <service
-            android:name=".ClipboardTileService"
-            android:exported="true"
-            android:icon="@drawable/ic_clipboard"
-            android:label="Clipboard → PC"
-            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
-            <intent-filter>
-                <action android:name="android.service.quicksettings.action.QS_TILE" />
-            </intent-filter>
-        </service>
-
         <receiver
             android:name=".UpdateResultReceiver"
             android:exported="false" />

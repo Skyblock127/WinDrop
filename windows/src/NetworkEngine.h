@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -61,10 +62,28 @@ class NetworkEngine {
   void OnLinkUp();
 
   std::atomic<bool> enabled{true};
+  // An unpaired phone's offer waits this long for the user, then counts as declined.
+  static constexpr int kOfferWaitSec = 60;
 
-  // Live progress of the current transfer, polled by the overlay.
-  std::atomic<int> xferDir{0};  // 0 idle, 1 sending, 2 receiving
+  // Live progress, polled by the overlay: every transfer running now added together.
   std::atomic<uint64_t> xferDone{0}, xferTotal{0};
+  std::atomic<int> sendingNow{0}, receivingNow{0};
+  // One transfer under way. `done` grows as it goes (see Progress in the .cpp).
+  struct Live {
+    bool sending = false;
+    std::wstring name, phone;  // the file, and the phone it goes to or comes from
+    std::string phoneId;
+    uint64_t total = 0;
+    std::atomic<uint64_t> done{0};
+  };
+  struct Running {
+    bool sending;
+    std::wstring name, phone;
+    uint64_t done, total;
+  };
+  std::vector<Running> Transfers();  // what's being sent and received right now, oldest first
+  void Began(const std::shared_ptr<Live>& t);
+  void Ended(const std::shared_ptr<Live>& t);
 
  private:
   struct Job {
@@ -77,25 +96,28 @@ class NetworkEngine {
   enum class Result { Ok, Offline, Declined, Failed, Missing };
 
   void Post(UiEvent* e);
-  void SenderLoop();
+  void SenderLoop();  // paired phones: one of these per phone that can be sent to at once
+  void NearbyLoop();  // unpaired phones: on their own, so neither holds up the other
+  void PostResult(const Job& job, Result r, const std::wstring& name, const std::string& why);
   void ServerLoop();
   void TickerLoop();
   bool OpenListener();
-  Result SendOne(const Job& job);
+  Result SendOne(const Job& job, std::string* why);
   void HandleIncoming(SOCKET c, const std::string& ip);
   // `stranger`: the unpaired sender's name; its offers need the user's OK.
   void HandleSession(SecureChannel& ch, const std::string& ip, const std::string& phoneId,
                      const std::wstring* stranger = nullptr);
   void HandleOpen(SOCKET c, const std::string& ip);  // an unpaired phone wants to send
-  bool AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from, const std::string& fromId);
-  SOCKET CallNearby(const std::string& phoneId, std::string* ip);  // brings that phone onto the link
+  // `s`: the sender's connection; if it hangs up meanwhile, the question goes away.
+  bool AskOffer(const std::wstring& name, uint64_t size, const std::wstring& from, const std::string& fromId, SOCKET s);
+  // Brings that phone onto our group and connects to it. `tried`: links already tried (by LinkSeq).
+  SOCKET CallNearby(const std::string& phoneId, std::string* ip, ULONGLONG& until, std::vector<uint64_t>& tried);
   void UsedPhone(const std::string& phoneId);  // remember it as the default target
-  void HandOff(const std::string& phoneId);    // ask the phone on the link to let it go
   void HandlePair(SOCKET c, const std::string& ip);
   void PostIncompatible(const PeerVersion& peer);
   void ReceivePhoneLog(SecureChannel& ch, uint64_t size);
   bool WaitDecision(uint64_t* id, int seconds, std::function<void(uint64_t)> post);
-  SOCKET ConnectPeer(std::string* usedIp);
+  SOCKET ConnectTo(const std::string& ip);  // a phone on our Wi-Fi Direct group
 
   HWND notify_ = nullptr;
   std::atomic<bool> stop_{false};
@@ -106,8 +128,20 @@ class NetworkEngine {
   std::mutex qmx_;
   std::condition_variable qcv_;
   std::deque<Job> queue_;
-  bool flushing_ = false;
-  size_t flushLeft_ = 0;
+  std::vector<std::string> sendingTo_;  // phones a SenderLoop is busy with (under qmx_)
+  std::deque<Job> nearbyQueue_;  // under qmx_
+  std::condition_variable ncv_;
+  std::map<std::string, size_t> flushLeft_;       // per phone: its outbox items still queued
+  std::map<std::string, ULONGLONG> flushAfter_;  // per phone: don't try its outbox again before this
+
+  std::mutex pmx_;
+  std::vector<std::shared_ptr<Live>> running_;    // under pmx_
+  std::map<std::string, ULONGLONG> lastActive_;  // per phone: when a transfer with it last began or ended; under pmx_
+  bool PhoneIdle(const std::string& phoneId, ULONGLONG now);  // nothing with it for 10 s
+  // Asks that phone to let go of its link (some Wi-Fi cards take only so many phones at once).
+  void HandOff(const std::string& phoneId);
+  std::atomic<bool> handingOff_{false};
+  ULONGLONG nextHandOff_ = 0;  // under tmx_
 
   std::mutex omx_;
   std::condition_variable ocv_;
@@ -129,13 +163,10 @@ class NetworkEngine {
   int backoffSec_ = 15;
   ULONGLONG nextProbe_ = 0;
   std::string waking_;         // the phone the beacon is calling (one link at a time)
-  std::string failReason_;     // why the last nearby send failed (sender thread only)
   std::string calling_;        // nearby (unpaired) phone being called for a send; under tmx_
-  std::string nearbyOnLink_;   // nearby phone on the link, and the link it came on
-  uint64_t nearbyLinkSeq_ = 0;
+  std::string nearbyOnLink_, nearbyIp_;  // the nearby phone we're sending to, and where it is
   ULONGLONG wakingSince_ = 0;
   std::atomic<ULONGLONG> lastActivity_{0};  // end of the last transfer
-  std::atomic<bool> handingOff_{false};
 };
 
 }  // namespace td

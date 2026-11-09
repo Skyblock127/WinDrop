@@ -5,6 +5,8 @@
 #include "Radios.h"
 #include "Settings.h"
 
+#include <algorithm>
+#include <functional>
 #include <map>
 
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
@@ -31,9 +33,18 @@ std::atomic<int> gAccepting{0};
 std::mutex gPeerMx;
 BluetoothLEAdvertisementPublisher gBeacon{nullptr};
 BluetoothLEAdvertisementPublisher gNearbyBeacon{nullptr};  // "WE" visible / "WC" calling a nearby phone
-WiFiDirectDevice gPeer{nullptr};  // the link lives as long as this object does
-std::string gPeerIp;
-std::wstring gPeerName;                          // Wi-Fi Direct name of the phone on the link
+// A phone on our group. Its link lives as long as its device object does.
+struct Peer {
+  WiFiDirectDevice dev{nullptr};
+  std::wstring devId;    // Windows' id for that phone: one entry per phone
+  std::wstring name;     // its Wi-Fi Direct name
+  std::string ip;
+  uint64_t seq = 0;      // LinkSeq() when it came up
+  std::string phoneId;   // the paired phone it proved to be; empty until then (and for strangers)
+  bool sawConn = false;  // it has connected to us over the link
+  ULONGLONG at = 0;      // when it came up
+};
+std::vector<Peer> gPeers;                          // under gPeerMx
 std::map<std::wstring, ULONGLONG> gRejectedUntil;  // by Wi-Fi Direct name; under gPeerMx
 
 // Drops a half-made pairing so the next attempt starts clean. A good pairing is kept: re-pairing
@@ -50,12 +61,39 @@ void Unpair(winrt::hstring id) {
   }
 }
 
-void DropPeer() {
-  std::lock_guard<std::mutex> lk(gPeerMx);
-  if (gPeer) try { gPeer.Close(); } catch (...) {}
-  gPeer = nullptr;
-  gPeerIp.clear();
-  gPeerName.clear();
+// Closes the links `pick` chooses (all of them when it's empty), outside the lock: closing can block.
+void DropPeers(const std::function<bool(const Peer&)>& pick) {
+  std::vector<WiFiDirectDevice> gone;
+  {
+    std::lock_guard<std::mutex> lk(gPeerMx);
+    for (auto it = gPeers.begin(); it != gPeers.end();) {
+      if (!pick || pick(*it)) {
+        gone.push_back(it->dev);
+        it = gPeers.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto& d : gone)
+    if (d) try { d.Close(); } catch (...) {}
+}
+
+// That phone's link went down by itself: forget it (the others stay).
+void LinkDown(WiFiDirectDevice const& d) {
+  std::string ip;
+  std::wstring name;
+  {
+    std::lock_guard<std::mutex> lk(gPeerMx);
+    for (auto it = gPeers.begin(); it != gPeers.end(); ++it)
+      if (winrt::get_abi(it->dev) == winrt::get_abi(d)) {
+        ip = it->ip;
+        name = it->name;
+        gPeers.erase(it);
+        break;
+      }
+  }
+  if (!ip.empty()) Log("wfd: link down (%s, %s)", W2U(name).c_str(), ip.c_str());
 }
 
 winrt::Windows::Storage::Streams::IBuffer Buf(const std::string& s) {
@@ -79,13 +117,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
   auto info = req.DeviceInformation();
   Log("wfd: connection request from %s (paired=%d)", W2U(std::wstring(info.Name())).c_str(), (int)info.Pairing().IsPaired());
   TheWifiDirect().PhoneFoundUs();  // whatever happens next, the phone could find us this way
-  // One phone at a time: while another is mid-transfer, say no; it retries in a few seconds. An
-  // idle link gives way (its phone reconnects when it next needs us).
-  if (!TheWifiDirect().PeerIp().empty() && TheWifiDirect().busy > 0) {
-    Log("wfd: refused %s: another phone is transferring", W2U(std::wstring(info.Name())).c_str());
-    try { req.Close(); } catch (...) {}
-    return;
-  }
+  // Another phone already on the group stays on it: each has its own link (see Peer).
   {
     std::lock_guard<std::mutex> lk(gPeerMx);
     auto r = gRejectedUntil.find(std::wstring(info.Name()));
@@ -115,6 +147,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
         op.Cancel();
         custom.PairingRequested(token);
         Log("wfd: pairing timed out");
+        TheWifiDirect().JoinFailed();
         TheWifiDirect().Refresh();  // the phone retries: be findable again straight away
         Unpair(info.Id());
         return;
@@ -127,6 +160,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
       if (r.Status() != DevicePairingResultStatus::Paired && r.Status() != DevicePairingResultStatus::AlreadyPaired &&
           !TheWifiDirect().AsGroupOwner()) {
         Unpair(info.Id());  // half-made pairing would block the next attempt
+        TheWifiDirect().JoinFailed();
         TheWifiDirect().Refresh();
         return;
       }
@@ -137,6 +171,7 @@ void Accept(WiFiDirectConnectionRequest const& req) {
     if (open.wait_for(std::chrono::seconds(20)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
       open.Cancel();
       Log("wfd: opening the link timed out");
+      TheWifiDirect().JoinFailed();
       Unpair(info.Id());
       TheWifiDirect().Refresh();
       return;
@@ -155,18 +190,33 @@ void Accept(WiFiDirectConnectionRequest const& req) {
       break;
     }
     dev.ConnectionStatusChanged([](WiFiDirectDevice const& d, auto const&) {
-      if (d.ConnectionStatus() == WiFiDirectConnectionStatus::Disconnected) {
-        Log("wfd: link down");
-        DropPeer();
-      }
+      if (d.ConnectionStatus() == WiFiDirectConnectionStatus::Disconnected) LinkDown(d);
     });
+    std::wstring devId(info.Id());
+    std::vector<WiFiDirectDevice> old;
     {
+      // The same phone again (it rejoined): its old link object goes. Other phones' links stay:
+      // closing one of theirs here is what made two phones knock each other off, every few seconds.
       std::lock_guard<std::mutex> lk(gPeerMx);
-      if (gPeer) try { gPeer.Close(); } catch (...) {}
-      gPeer = dev;
-      gPeerIp = ip;
-      gPeerName = std::wstring(info.Name());
+      for (auto it = gPeers.begin(); it != gPeers.end();) {
+        if (it->devId == devId || it->ip == ip) {
+          old.push_back(it->dev);
+          it = gPeers.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      Peer p;
+      p.dev = dev;
+      p.devId = devId;
+      p.name = std::wstring(info.Name());
+      p.ip = ip;
+      p.at = GetTickCount64();
+      gPeers.push_back(std::move(p));
     }
+    for (auto& o : old)
+      if (o && winrt::get_abi(o) != winrt::get_abi(dev)) try { o.Close(); } catch (...) {}
+    TheWifiDirect().JoinWorked();
     TheWifiDirect().LinkUp(began, ip);
     // Push queued items now instead of waiting for the phone to say something over the new link.
     if (auto cb = TheWifiDirect().onLinkUp) cb();
@@ -187,28 +237,51 @@ WifiDirectHost& TheWifiDirect() {
 
 void WifiDirectHost::LinkUp(ULONGLONG since, const std::string& ip) {
   uint64_t seq;
+  std::string authed;
+  bool saw;
   {
     // The phone can get its address and connect before Accept() gets here.
     std::lock_guard<std::mutex> lk(mx_);
     seq = ++linkSeq_;
-    if (lastAuthIp_ == ip && lastAuthAt_ >= since) {
-      authedSeq_ = seq;
-      authedPhone_ = lastAuthPhone_;
-    }
-    if (lastSawIp_ == ip && lastSawAt_ >= since) sawConnSeq_ = seq;
+    authed = lastAuthIp_ == ip && lastAuthAt_ >= since ? lastAuthPhone_ : "";
+    saw = lastSawIp_ == ip && lastSawAt_ >= since;
   }
-  std::thread([this, seq] {
+  {
+    std::lock_guard<std::mutex> lk(gPeerMx);
+    for (auto& p : gPeers)
+      if (p.ip == ip) {
+        p.seq = seq;
+        if (!authed.empty()) p.phoneId = authed;
+        p.sawConn = p.sawConn || saw;
+      }
+  }
+  std::thread([this, seq, ip] {
     Sleep(kAuthGraceMs);
     // A pairing phone proves itself only once the user clicks Yes, which can take up to a minute;
-    // a transfer in progress is a proven phone.
-    while (linkSeq_ == seq && authedSeq_ != seq && (pairExchanges > 0 || busy > 0)) Sleep(500);
-    if (linkSeq_ == seq && authedSeq_ != seq && !PeerIp().empty()) {
-      if (sawConnSeq_ != seq) {
+    // a nearby (unpaired) phone never does, but its exchange keeps it (pairExchanges).
+    for (;;) {
+      bool on = false, proven = false, saw = false;
+      {
+        std::lock_guard<std::mutex> lk(gPeerMx);
+        for (auto& p : gPeers)
+          if (p.seq == seq) {
+            on = true;
+            proven = !p.phoneId.empty();
+            saw = p.sawConn;
+          }
+      }
+      if (!on || proven) return;
+      if (pairExchanges > 0 || busy > 0) {
+        Sleep(500);
+        continue;
+      }
+      if (!saw) {
         Log("wfd: the phone never connected over the link: a firewall or antivirus on this PC is probably blocking WinDrop");
         if (onUnreachable) onUnreachable();
       }
-      Log("wfd: link never proved it's a paired phone, dropping it");
-      DropPeer();
+      Log("wfd: link to %s never proved it's a paired phone, dropping it", ip.c_str());
+      DropPeers([seq](const Peer& p) { return p.seq == seq; });
+      return;
     }
   }).detach();
 }
@@ -222,28 +295,108 @@ void WifiDirectHost::PhoneFoundUs() {
   Log("wfd: the phone found this PC %s; advertising that way from now on", go ? "as group owner" : "in listen mode");
 }
 
-// Both take mx_ before reading the peer (same order as Status()), so LinkUp can't slip in between.
-void WifiDirectHost::SawConnection(const std::string& ip) {
+void WifiDirectHost::JoinFailed() {
+  if (asGroupOwner_ || Pairing()) return;  // pairing takes turns by itself
+  ULONGLONG now = GetTickCount64();
+  bool again;
+  {
+    std::lock_guard<std::mutex> lk(mx_);
+    again = failedJoinAt_ && now - failedJoinAt_ < 180000;
+    failedJoinAt_ = now;
+  }
+  if (!again || now < goTrialUntil_) return;
+  goTrialUntil_ = now + 60000;
+  Log("wfd: joins keep failing in listen mode; advertising as group owner for a minute");
+  Refresh();
+}
+
+void WifiDirectHost::JoinWorked() {
   std::lock_guard<std::mutex> lk(mx_);
-  lastSawIp_ = ip;
-  lastSawAt_ = GetTickCount64();
-  if (!ip.empty() && ip == PeerIp()) sawConnSeq_ = linkSeq_.load();
+  failedJoinAt_ = 0;
+}
+
+// Both note the address under mx_ first (LinkUp reads it there), then mark the link if it's
+// registered already.
+void WifiDirectHost::SawConnection(const std::string& ip) {
+  {
+    std::lock_guard<std::mutex> lk(mx_);
+    lastSawIp_ = ip;
+    lastSawAt_ = GetTickCount64();
+  }
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  for (auto& p : gPeers)
+    if (p.ip == ip) p.sawConn = true;
 }
 
 void WifiDirectHost::MarkAuthenticated(const std::string& phoneId, const std::string& ip) {
-  std::lock_guard<std::mutex> lk(mx_);
-  lastAuthIp_ = ip;
-  lastAuthPhone_ = phoneId;
-  lastAuthAt_ = GetTickCount64();
-  if (ip != PeerIp()) return;  // not over the link (or the link isn't registered yet: see LinkUp)
-  authedSeq_ = linkSeq_.load();
-  authedPhone_ = phoneId;
+  {
+    std::lock_guard<std::mutex> lk(mx_);
+    lastAuthIp_ = ip;
+    lastAuthPhone_ = phoneId;
+    lastAuthAt_ = GetTickCount64();
+  }
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  for (auto& p : gPeers) {
+    if (p.ip == ip) p.phoneId = phoneId;
+  }
 }
 
-std::string WifiDirectHost::LinkedPhone() {
-  if (PeerIp().empty()) return "";
-  std::lock_guard<std::mutex> lk(mx_);
-  return authedSeq_ == linkSeq_ ? authedPhone_ : "";
+std::string WifiDirectHost::PeerIp() {
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  const Peer* best = nullptr;
+  for (auto& p : gPeers)
+    if (!best || p.seq > best->seq) best = &p;
+  return best ? best->ip : "";
+}
+
+bool WifiDirectHost::HasPeer(const std::string& ip) {
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  return std::any_of(gPeers.begin(), gPeers.end(), [&](const Peer& p) { return p.ip == ip; });
+}
+
+std::string WifiDirectHost::IpOf(const std::string& phoneId) {
+  if (phoneId.empty()) return "";
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  const Peer* best = nullptr;
+  for (auto& p : gPeers)
+    if (p.phoneId == phoneId && (!best || p.seq > best->seq)) best = &p;
+  return best ? best->ip : "";
+}
+
+std::vector<std::pair<uint64_t, std::string>> WifiDirectHost::UnprovenLinks() {
+  std::vector<std::pair<uint64_t, std::string>> v;
+  {
+    std::lock_guard<std::mutex> lk(gPeerMx);
+    for (auto& p : gPeers)
+      if (p.phoneId.empty()) v.push_back({p.seq, p.ip});
+  }
+  std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+  return v;
+}
+
+std::vector<std::string> WifiDirectHost::UnprovenIps() {
+  std::vector<std::string> ips;
+  for (auto& [seq, ip] : UnprovenLinks()) ips.push_back(ip);
+  return ips;
+}
+
+bool WifiDirectHost::FreshLink(const std::string& ip) {
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  ULONGLONG now = GetTickCount64();
+  return std::any_of(gPeers.begin(), gPeers.end(), [&](const Peer& p) { return p.ip == ip && now - p.at < 8000; });
+}
+
+bool WifiDirectHost::IsUnproven(const std::string& ip) {
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  return std::any_of(gPeers.begin(), gPeers.end(), [&](const Peer& p) { return p.ip == ip && p.phoneId.empty(); });
+}
+
+std::vector<std::string> WifiDirectHost::LinkedPhones() {
+  std::vector<std::string> ids;
+  std::lock_guard<std::mutex> lk(gPeerMx);
+  for (auto& p : gPeers)
+    if (!p.phoneId.empty() && std::find(ids.begin(), ids.end(), p.phoneId) == ids.end()) ids.push_back(p.phoneId);
+  return ids;
 }
 
 void WifiDirectHost::Refresh() {
@@ -268,24 +421,20 @@ void WifiDirectHost::ClosePairWindow() {
   Refresh();  // back to advertising the saved way (only once no phone is linked)
 }
 
-void WifiDirectHost::RejectPeer() {
+void WifiDirectHost::RejectPeer(const std::string& ip) {
   {
     std::lock_guard<std::mutex> lk(gPeerMx);
-    if (gPeerName.empty()) return;
-    gRejectedUntil[gPeerName] = GetTickCount64() + 10 * 60 * 1000;
-    Log("wfd: %s isn't paired here; ignoring it for 10 minutes", W2U(gPeerName).c_str());
+    auto it = std::find_if(gPeers.begin(), gPeers.end(), [&](const Peer& p) { return p.ip == ip; });
+    if (it == gPeers.end() || it->name.empty()) return;
+    gRejectedUntil[it->name] = GetTickCount64() + 10 * 60 * 1000;
+    Log("wfd: %s isn't paired here; ignoring it for 10 minutes", W2U(it->name).c_str());
   }
-  Disconnect();
+  Disconnect(ip);
 }
 
-void WifiDirectHost::Disconnect() {
-  // Closing the device object ends the group; do it off the network thread.
-  std::thread([] { DropPeer(); }).detach();
-}
-
-std::string WifiDirectHost::PeerIp() {
-  std::lock_guard<std::mutex> lk(gPeerMx);
-  return gPeerIp;
+void WifiDirectHost::Disconnect(const std::string& ip) {
+  // Closing a device object can block: do it off the network thread.
+  std::thread([ip] { DropPeers([&](const Peer& p) { return ip.empty() || p.ip == ip; }); }).detach();
 }
 
 // The name Windows uses in Wi-Fi Direct discovery (NetBIOS computer name), cut to what fits in a
@@ -444,6 +593,9 @@ void WifiDirectHost::Loop() {
         ULONGLONG turn = (GetTickCount64() - pairFrom_) / kPairTurnMs;
         if (turn % 2) go = !go;
         turnEnds = pairFrom_ + (turn + 1) * kPairTurnMs;
+      } else if (!go && GetTickCount64() < goTrialUntil_) {
+        go = true;  // a trial turn (JoinFailed); the saved way again after it unless a phone came
+        turnEnds = goTrialUntil_;
       }
       asGroupOwner_ = go;
       adv.IsAutonomousGroupOwnerEnabled(go);
@@ -529,7 +681,7 @@ void WifiDirectHost::Loop() {
     if (cv_.wait_for(lk, std::chrono::seconds(backoff), [&] { return stop_; })) break;
     backoff = std::min(backoff * 2, 60);
   }
-  DropPeer();
+  DropPeers(nullptr);
   running_ = false;
   {
     std::lock_guard<std::mutex> lk(mx_);

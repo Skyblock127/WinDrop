@@ -51,6 +51,10 @@ class MainActivity : Activity() {
     private lateinit var overlayBtn: Button
     private lateinit var batteryBtn: Button
     private lateinit var locationBtn: Button
+    private lateinit var nowCard: LinearLayout
+    private lateinit var nowTitle: TextView
+    private lateinit var nowSub: TextView
+    private lateinit var nowBar: Bar
     private lateinit var outboxCard: LinearLayout
     private lateinit var outboxNote: TextView
     private lateinit var outboxList: LinearLayout
@@ -157,12 +161,27 @@ class MainActivity : Activity() {
         return "%d:%02d".format(s / 60, s % 60)
     }
 
-    // Counts down "nearby PCs can send" while the screen is open.
+    // Counts down "nearby PCs can send", and moves a transfer's bar, while the screen is open.
     private val tick = object : Runnable {
         override fun run() {
             renderVisible()
-            status.postDelayed(this, 1000)
+            renderNow()
+            status.postDelayed(this, if (WinDropService.instance?.transferName.isNullOrEmpty()) 1000 else 400)
         }
+    }
+
+    private fun renderNow() {
+        val svc = WinDropService.instance
+        val name = svc?.transferName.orEmpty()
+        nowCard.visibility = if (name.isEmpty()) View.GONE else View.VISIBLE
+        if (svc == null || name.isEmpty()) return
+        val done = svc.xferDone
+        val total = svc.xferTotal
+        val frac = if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else 1f
+        nowTitle.text = name
+        nowSub.text = "${if (svc.transferSending) "To" else "From"} ${svc.transferPeer} \u00b7 " +
+            "${humanSize(done)} of ${humanSize(total)} \u00b7 ${(frac * 100).toInt()}%"
+        nowBar.set(frac)
     }
 
     @SuppressLint("SetTextI18n", "UseSwitchCompatOrMaterialCode")
@@ -207,11 +226,22 @@ class MainActivity : Activity() {
 
         // ---- send, and letting nearby PCs send
         val main = card(col)
-        button("Send clipboard to PC", main, filled = false) { startActivity(ClipboardSendActivity.intent(this)) }
+        button("Send clipboard", main, filled = true) { startActivity(ClipboardSendActivity.intent(this)) }
             .apply { (layoutParams as LinearLayout.LayoutParams).topMargin = 0 }
         visibleRow = ToggleRow(main, "Let nearby PCs send") { toggleVisible() }
         (visibleRow.row.layoutParams as LinearLayout.LayoutParams).topMargin = dp(6)
         visibleBar = Bar(main)
+
+        // ---- a transfer under way: what, with whom, and how far
+        nowCard = card(col)
+        nowCard.addView(label("IN PROGRESS", 12f, ACCENT, bold = true).apply { letterSpacing = 0.08f })
+        nowTitle = label("", 15f).apply {
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE; setPadding(0, dp(8), 0, 0)
+        }
+        nowCard.addView(nowTitle)
+        nowSub = label("", 12f, MUTED).apply { setPadding(0, dp(2), 0, dp(8)) }
+        nowCard.addView(nowSub)
+        nowBar = Bar(nowCard)
 
         // ---- pairing
         val pair = card(col)
@@ -219,6 +249,7 @@ class MainActivity : Activity() {
         val pcRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            isBaselineAligned = false
             background = rounded(FIELD, 14)
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
@@ -229,7 +260,8 @@ class MainActivity : Activity() {
         pcSub = label("", 13f, MUTED)
         pcTexts.addView(pcName)
         pcTexts.addView(pcSub)
-        pcRow.addView(pcTexts)
+        // The rest of the row: a long PC name wraps instead of being cut.
+        pcRow.addView(pcTexts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         pair.addView(pcRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(10)
         })
@@ -603,6 +635,7 @@ class MainActivity : Activity() {
         pcNote.visibility = if (prefs.paired) View.GONE else View.VISIBLE
         renderPair()
         renderVisible()
+        renderNow()
         dropRow.set(prefs.dropLow, "For phones whose own drag panel covers the top, like vivo's Drag & Go")
 
         val needWifi = prefs.enabled && !Radios.wifiOn(this)

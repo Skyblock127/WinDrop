@@ -53,7 +53,9 @@ class WinDropService : Service() {
         const val ACTION_STOP = "com.windrop.app.STOP_SERVICE"
         const val ACTION_SEND = "com.windrop.app.SEND"
         const val ACTION_DECIDE = "com.windrop.app.DECIDE"
+        const val ACTION_PICK = "com.windrop.app.PICK"  // the chooser's notification: send it there
         const val EXTRA_OFFER = "offer_id"
+        const val EXTRA_TARGET = "target"
         const val EXTRA_ACCEPT = "accept"
         const val SHARE_CATEGORY = "com.windrop.app.category.SEND_TO_PC"
 
@@ -67,12 +69,18 @@ class WinDropService : Service() {
         // How long pairing looks for a PC with "Pair phone…" open (that stays open 3 minutes).
         private const val PAIR_FIND_MS = 90_000L
         private const val NOTIF_OFFER = 2
+        private const val NOTIF_CHOOSE = 3
         // A link to a nearby (unpaired) PC is let go this soon after its last transfer.
         private const val OPEN_IDLE_MS = 8_000L
         private const val OWN_PC = "\u0000own"  // the chooser's id for our paired PC
         private const val AUTO_ANSWER_MS = 120_000L
         /** "Let nearby PCs send" lasts this long. */
         const val VISIBLE_MS = 10 * 60_000L
+        // Once those 10 minutes run out by themselves (not switched off), a PC that picked this
+        // phone just before still gets through for this long. New PCs can't pick it by then.
+        private const val VISIBLE_GRACE_MS = 60_000L
+        // A nearby PC that called us and then went quiet this long has given up: so do we.
+        private const val CALL_QUIET_MS = 12_000L
 
         @Volatile var instance: WinDropService? = null
             private set
@@ -123,7 +131,9 @@ class WinDropService : Service() {
     /** Until when nearby (unpaired) PCs may send to us; 0 = not visible. */
     @Volatile var visibleUntil = 0L; private set
     val visible get() = System.currentTimeMillis() < visibleUntil
-    private val stopVisible = Runnable { setVisible(false) }
+    @Volatile private var graceUntil = 0L  // see VISIBLE_GRACE_MS
+    private val visibleOrJustEnded get() = visible || System.currentTimeMillis() < graceUntil
+    private val stopVisible = Runnable { endVisible(byUser = false) }
     // Nearby PCs that let phones send to them ("WE" beacon): name -> last heard (elapsedRealtime).
     private val nearbyPcs = java.util.concurrent.ConcurrentHashMap<String, Long>()
     @Volatile private var nearbyError: String? = null  // why the last nearby send failed, for the pill
@@ -167,6 +177,11 @@ class WinDropService : Service() {
     // What the notification and pill show while a transfer runs.
     @Volatile private var xferName = ""
     @Volatile private var xferSending = false
+    @Volatile private var xferPeer = ""
+    /** The transfer under way (empty name: none), for the app screen. */
+    val transferName get() = xferName
+    val transferSending get() = xferSending
+    val transferPeer get() = xferPeer
     private val progressTick = object : Runnable {
         override fun run() {
             if (xferName.isEmpty()) return
@@ -231,7 +246,7 @@ class WinDropService : Service() {
         val now = System.currentTimeMillis()
         if (now - wifiWarnedAt < 120_000) return
         wifiWarnedAt = now
-        ui(Island.Msg("Wi-Fi is off", sub, Island.G_WARN, Island.AMBER, onClick = { Radios.openWifi(this) }), 4000, "Wi-Fi is off — $sub")
+        ui(Island.Msg("Wi-Fi is off", sub, Island.G_WARN, Island.AMBER, onClick = { Radios.openWifi(this) }, action = "Wi-Fi settings"), 4000, "Wi-Fi is off — $sub")
     }
 
     // ---- lifecycle ----
@@ -253,6 +268,7 @@ class WinDropService : Service() {
                 lastActivity = System.currentTimeMillis()
                 // While pairing, the old key (if any) is about to be replaced: wait for the new one.
                 // A nearby PC isn't ours: nothing of ours goes to it.
+                linkRetries = 0
                 if (!pairing && p2p.openTarget == null) { flushOutbox(); uploadLogs() }
                 main.removeCallbacks(idleCheck)
                 main.postDelayed(idleCheck, 3000)
@@ -316,6 +332,7 @@ class WinDropService : Service() {
             ACTION_START -> if (!island.attached) island.attach()
             ACTION_SEND -> drainPending()
             ACTION_DECIDE -> decide(intent.getLongExtra(EXTRA_OFFER, -1), intent.getBooleanExtra(EXTRA_ACCEPT, false))
+            ACTION_PICK -> island.pickId(intent.getStringExtra(EXTRA_TARGET))
             null -> if (!prefs.enabled) { stopSelf(); return START_NOT_STICKY }
         }
         return if (prefs.enabled) START_STICKY else START_NOT_STICKY
@@ -366,13 +383,14 @@ class WinDropService : Service() {
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(Notification.Action.Builder(null, "Clipboard → PC",
+            .addAction(Notification.Action.Builder(null, "Send clipboard",
                 PendingIntent.getActivity(this, 3, ClipboardSendActivity.intent(this), PendingIntent.FLAG_IMMUTABLE)).build())
             .addAction(Notification.Action.Builder(null, "Turn off", stop).build())
         val name = xferName
         val pc = prefs.pcLabel
         when {
             name.isNotEmpty() -> {
+                val pc = xferPeer.ifEmpty { prefs.pcLabel }
                 val total = xferTotal
                 val done = xferDone
                 val pct = if (total > 0) (done * 100 / total).toInt() else 0
@@ -415,7 +433,8 @@ class WinDropService : Service() {
     private fun linkIp() = if (::p2p.isInitialized) p2p.connectedIp else null
     private fun linkWanted() = ::p2p.isInitialized && p2p.wanted
 
-    private fun startProgress(name: String, sending: Boolean) {
+    private fun startProgress(name: String, sending: Boolean, peer: String) {
+        xferPeer = peer
         xferName = name
         xferSending = sending
         main.removeCallbacks(progressTick)
@@ -461,10 +480,10 @@ class WinDropService : Service() {
     fun setVisible(on: Boolean): Boolean {
         main.removeCallbacks(stopVisible)
         if (!on) {
-            if (visibleUntil != 0L) Logs.i("nearby: visibility off")
-            visibleUntil = 0
-            nearbyAdv.stop()
+            endVisible(byUser = true)
+            return true
         } else {
+            graceUntil = 0
             if (!nearbyAdv.start(!Radios.wifiOn(this))) return false
             visibleUntil = System.currentTimeMillis() + VISIBLE_MS
             main.postDelayed(stopVisible, VISIBLE_MS)
@@ -472,6 +491,15 @@ class WinDropService : Service() {
         updateServiceNotification()
         notifyListeners()
         return true
+    }
+
+    private fun endVisible(byUser: Boolean) {
+        if (visibleUntil != 0L) Logs.i("nearby: visibility ${if (byUser) "off" else "ran out"}")
+        graceUntil = if (byUser || visibleUntil == 0L) 0L else System.currentTimeMillis() + VISIBLE_GRACE_MS
+        visibleUntil = 0
+        nearbyAdv.stop()
+        updateServiceNotification()
+        notifyListeners()
     }
 
     private fun isOwnPc(name: String) = prefs.paired &&
@@ -491,17 +519,42 @@ class WinDropService : Service() {
             if (nearbyPcs.put(name, android.os.SystemClock.elapsedRealtime()) == null) Logs.i("nearby: $name takes files from nearby phones")
             return
         }
-        if (!visible || !call.contentEquals(nearbyAdv.tag)) return
+        if (!visibleOrJustEnded || !call.contentEquals(nearbyAdv.tag)) return
+        lastCallAt = android.os.SystemClock.elapsedRealtime()
         if (p2p.openTarget == name && (p2p.connectedIp != null || p2p.wanted)) return  // on our way
         if (pairing || queued.get() > 0 || receiving.get() > 0) return  // busy: it keeps calling
         if (!Radios.wifiOn(this)) { warnWifiOff("$name has something for you: turn Wi-Fi on to get it"); return }
         if (pcWifiOff) Logs.w("nearby: $name calls us but its Wi-Fi is off")
         Logs.i("nearby: $name has something for us")
         startOpenLink(name, incoming = true)
+        calledBy = name
+        main.removeCallbacks(callWatch)
+        main.postDelayed(callWatch, 2000)
+    }
+
+    @Volatile private var lastCallAt = 0L
+    private var calledBy: String? = null  // the nearby PC whose call we're answering (main thread)
+
+    /** The PC that called us stopped calling before we got onto its link: it gave up, so do we. */
+    private val callWatch = object : Runnable {
+        override fun run() {
+            val pc = calledBy ?: return
+            if (p2p.openTarget != pc || !p2p.wanted || p2p.connectedIp != null) { calledBy = null; return }
+            if (android.os.SystemClock.elapsedRealtime() - lastCallAt > CALL_QUIET_MS) {
+                Logs.i("nearby: $pc stopped calling; not joining it")
+                calledBy = null
+                p2p.release()
+                if (island.attached) island.connectingDone()
+                updateServiceNotification()
+                return
+            }
+            main.postDelayed(this, 2000)
+        }
     }
 
     /** Joins a nearby PC's link (letting go of any other link first). Main thread. */
     private fun startOpenLink(pc: String, incoming: Boolean) {
+        if (!incoming) calledBy = null
         val hadLink = p2p.connectedIp != null
         if (hadLink || p2p.wanted) p2p.release()
         val go = Runnable {
@@ -558,14 +611,21 @@ class WinDropService : Service() {
         }
         Logs.i("nearby: sending ${items.size} item(s) to $pc")
         queued.addAndGet(items.size)
+        val gen = sendGen.get()
+        fun live() = gen == sendGen.get()
         sender.execute {
             // It may have stopped taking files a moment ago: make sure before joining it.
-            if (!nearbyFresh(pc, 4_000)) {
-                ui(Island.Msg("Looking for $pc\u2026", "Checking it still takes files", Island.G_UP), 3000, "Looking for $pc\u2026")
+            if (!nearbyFresh(pc, 15_000)) {
+                ui(Island.Msg("Looking for $pc\u2026", "Checking it still takes files", Island.G_UP, cancels = true), 3000, "Looking for $pc\u2026")
                 val until = System.currentTimeMillis() + 6_000
-                while (!nearbyFresh(pc, 4_000) && System.currentTimeMillis() < until && !stopped) Thread.sleep(250)
+                while (!nearbyFresh(pc, 15_000) && System.currentTimeMillis() < until && !stopped && live()) Thread.sleep(250)
             }
-            if (!nearbyFresh(pc, 4_000)) {
+            if (!live() || !nearbyFresh(pc, 15_000)) {
+                if (!live()) {
+                    items.forEach { it.close() }
+                    if (queued.addAndGet(-items.size) == 0) main.post { island.transferEnded(); updateServiceNotification() }
+                    return@execute
+                }
                 Logs.w("nearby: $pc is gone")
                 ui(Island.Msg("$pc isn't taking files now", "It stopped letting nearby phones send", Island.G_WARN, Island.AMBER), 3500,
                     "$pc isn't taking files now")
@@ -576,12 +636,11 @@ class WinDropService : Service() {
             main.post { startOpenLink(pc, incoming = false) }
             val until = System.currentTimeMillis() + 50_000
             fun linked() = p2p.openTarget == pc && p2p.connectedIp != null
-            while (!linked() && System.currentTimeMillis() < until && !stopped) {
-                if (!nearbyFresh(pc, 10_000)) { nearbyError = "$pc stopped taking files from nearby phones"; break }
-                Thread.sleep(250)
-            }
+            // Not given up when its beacon stops: if its 10 minutes just ran out, the PC still lets a
+            // phone that picked it in for a minute; if it was switched off, the PC says so.
+            while (!linked() && System.currentTimeMillis() < until && !stopped && live()) Thread.sleep(250)
             if (!linked()) Logs.w("nearby: couldn't reach $pc")
-            for (item in items) process(item, to = pc)
+            for (item in items) process(item, to = pc, gen = gen)
         }
     }
 
@@ -634,8 +693,9 @@ class WinDropService : Service() {
         val res = BooleanArray(2)
         synchronized(decisions) { decisions[id] = latch to res }
         val shown = if (offer.type == Proto.TYPE_TEXT) "text" else name
+        val until = android.os.SystemClock.uptimeMillis() + 60_000
         main.post {
-            if (island.attached) island.showOffer(id, shown, offer.size, from)
+            if (island.attached) island.showOffer(id, shown, offer.size, from, until)
             else showOfferNotification(id, shown, Proto.Offer(offer.type, offer.size, shown, from, ""))
         }
         val yes = latch.await(60, TimeUnit.SECONDS) && res[0]
@@ -647,6 +707,32 @@ class WinDropService : Service() {
         }
         Logs.i("nearby: ${offer.name} from $from ${if (yes) "accepted" else "declined"}")
         return yes
+    }
+
+    // Swiping the pill sideways cancels what's being sent: every item handed to the sender before
+    // that carries an older generation and is dropped when its turn comes (or mid-way).
+    private val sendGen = AtomicInteger(0)
+    @Volatile private var sendSocket: java.net.Socket? = null
+    @Volatile private var recvSocket: java.net.Socket? = null
+    @Volatile private var recvCancelled = false
+    // Items that went to the outbox while the link to our PC was coming up: cancelling takes them back.
+    private val attemptOutbox = java.util.Collections.synchronizedList(mutableListOf<Long>())
+
+    /** Stops what's being sent (and received) right now. Main thread. */
+    fun cancelTransfers() {
+        val g = sendGen.incrementAndGet()
+        Logs.i("cancelled on the pill (send generation $g)")
+        generateSequence { pending.poll() }.forEach { it.close() }
+        runCatching { sendSocket?.close() }
+        recvSocket?.let { recvCancelled = true; runCatching { it.close() } }
+        val taken = synchronized(attemptOutbox) { attemptOutbox.toList().also { attemptOutbox.clear() } }
+        if (taken.isNotEmpty()) cancelOutbox(taken)
+        if (p2p.openTarget != null && calledBy == null) {
+            p2p.release()  // a nearby PC we were joining only for this
+        } else if (p2p.connectedIp == null && p2p.wanted && !pairing) {
+            p2p.release()  // our PC's link, wanted only for this
+        }
+        updateServiceNotification()
     }
 
     private fun drainPending(choose: Boolean = true) {
@@ -669,22 +755,28 @@ class WinDropService : Service() {
             if (Radios.wifiOn(this)) { p2p.want(); showConnecting() }
             else warnWifiOff("Turn it on: this sends by itself then")
         }
+        val gen = sendGen.get()
         while (true) {
             val item = pending.poll() ?: break
             queued.incrementAndGet()
-            sender.execute { process(item) }
+            sender.execute { process(item, gen = gen) }
         }
         stopIfIdle()
     }
 
-    private enum class Result { OK, OFFLINE, DECLINED, FAILED, NOT_PAIRED }
+    private enum class Result { OK, OFFLINE, DECLINED, FAILED, NOT_PAIRED, CANCELLED }
 
     /** [to]: a nearby (unpaired) PC's name; nothing for it goes to the outbox. */
-    private fun process(item: OutgoingItem, to: String? = null) {
+    private fun process(item: OutgoingItem, to: String? = null, gen: Int = sendGen.get()) {
         try {
             if (item.outboxId != null && flushAbort) return
+            if (gen != sendGen.get()) {
+                item.outboxId?.let { outbox.remove(it) }
+                Logs.i("send ${item.name} -> cancelled")
+                return
+            }
             var target = to
-            var r = try { send(item, to) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
+            var r = try { send(item, to, gen) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
             if (r == Result.NOT_PAIRED) {
                 // Our PC removed this phone. If it takes files from nearby phones, send it that way.
                 val near = nearbyPcs.keys.firstOrNull { isOwnPc(it) && nearbyFresh(it, 9_000) }
@@ -694,13 +786,18 @@ class WinDropService : Service() {
                     Logs.i("nearby: $near forgot this phone; sending as a nearby phone instead")
                     p2p.openTarget = near  // same PC, same link: it just isn't ours any more
                     target = near
-                    r = try { send(item, near) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
+                    r = try { send(item, near, gen) } catch (e: Exception) { Logs.w("send failed", e); Result.FAILED }
                 }
             }
+            if (r != Result.OK && gen != sendGen.get()) r = Result.CANCELLED  // its connection was cut on purpose
             Logs.i("send ${item.name}${if (target != null) " to $target" else ""} -> $r")
             val label = target ?: prefs.pcLabel
             val reason = nearbyError
             nearbyError = null
+            if (r == Result.CANCELLED) {
+                item.outboxId?.let { outbox.remove(it) }
+                return
+            }
             if (target != null && (r == Result.OFFLINE || r == Result.FAILED)) {
                 val title = reason ?: if (r == Result.OFFLINE) "Couldn't reach $target" else "Transfer failed"
                 ui(Island.Msg(title, "${item.name} wasn't sent", Island.G_WARN, Island.AMBER), 3500, title)
@@ -717,6 +814,7 @@ class WinDropService : Service() {
                         else outbox.addFile(item.name, item.open())
                     } catch (e: Exception) { null }
                     val count = outbox.count
+                    if (entry != null && p2p.wanted) attemptOutbox += entry.id
                     Logs.i("queued ${item.name} until the link is up ($count waiting)")
                     main.post {
                         // While the link is coming up the pill already says "Connecting…"; with Wi-Fi
@@ -727,14 +825,17 @@ class WinDropService : Service() {
                         }
                         updateServiceNotification()
                     }
+                    retrySoon()
                 } else {
                     flushAbort = true
+                    retrySoon()
                 }
                 Result.DECLINED -> {
                     item.outboxId?.let { outbox.remove(it) }
                     ui(Island.Msg("$label declined ${item.name}", glyph = Island.G_X, accent = Island.RED), 2500, "$label declined")
                 }
                 Result.FAILED, Result.NOT_PAIRED -> ui(Island.Msg("Transfer failed", item.name, Island.G_WARN, Island.RED), 3000, "Transfer failed")
+                Result.CANCELLED -> {}
             }
         } finally {
             item.close()
@@ -744,7 +845,7 @@ class WinDropService : Service() {
         }
     }
 
-    private fun send(original: OutgoingItem, to: String? = null): Result {
+    private fun send(original: OutgoingItem, to: String? = null, gen: Int = sendGen.get()): Result {
         // On a nearby PC's link, our own PC isn't there: keep it for later.
         if (to == null && p2p.openTarget != null) return Result.OFFLINE
         var item = original
@@ -761,7 +862,9 @@ class WinDropService : Service() {
         } else try { openChannel() } catch (e: Incompatible) { reportIncompatible(e.peer); return Result.FAILED }
             catch (e: NotPaired) { return Result.NOT_PAIRED }
             ?: return if (prefs.paired) Result.OFFLINE else Result.FAILED
-        s.use {
+        sendSocket = s
+        if (gen != sendGen.get()) { runCatching { s.close() }; sendSocket = null; return Result.CANCELLED }
+        try { s.use {
             val out = ch.output
             val inp = DataInputStream(ch.input)
             try {
@@ -769,7 +872,7 @@ class WinDropService : Service() {
                     if (item.isText) "text.txt" else item.name, prefs.deviceName, prefs.deviceId))
                 out.flush()
             } catch (e: IOException) { return Result.OFFLINE }
-            if (to != null) ui(Island.Msg("Waiting for $to to accept", item.name, Island.G_UP), 3500, "Waiting for $to to accept")
+            if (to != null) ui(Island.Msg("Waiting for $to to accept", item.name, Island.G_UP, cancels = true), 3500, "Waiting for $to to accept")
 
             val d = try { inp.read() } catch (e: SocketTimeoutException) { return Result.FAILED } catch (e: IOException) { -1 }
             if (d == -1) return Result.FAILED
@@ -779,13 +882,14 @@ class WinDropService : Service() {
             xferTotal = item.size
             xferDone = 0
             Logs.i("sending ${item.name} (${humanSize(item.size)})")
-            startProgress(item.name, true)
+            startProgress(item.name, true, to ?: prefs.pcLabel)
             main.post { island.transferStarted(true, item.name, item.outboxId != null) }
             s.soTimeout = 30_000
             item.open().use { src ->
                 val buf = ByteArray(Proto.CHUNK)
                 var left = item.size
                 while (left > 0) {
+                    if (gen != sendGen.get()) return Result.CANCELLED
                     val n = src.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
                     if (n < 0) break
                     out.write(buf, 0, n)
@@ -796,7 +900,7 @@ class WinDropService : Service() {
                 if (left > 0) return Result.FAILED
             }
             return if (inp.read() == Proto.ACK_OK) Result.OK else Result.FAILED
-        }
+        } } finally { sendSocket = null }
     }
 
     /** The PC is only ever reached over the Wi-Fi Direct link. */
@@ -838,6 +942,24 @@ class WinDropService : Service() {
         return s to ch
     }
 
+    /** On the link, yet the PC didn't answer (a moment's hiccup): try what's waiting again shortly,
+     *  instead of leaving it until the link next comes up. */
+    private fun retrySoon() {
+        if (p2p.connectedIp == null || p2p.openTarget != null) return
+        main.post {
+            main.removeCallbacks(retryOutbox)
+            main.postDelayed(retryOutbox, 4000)
+        }
+    }
+
+    private var linkRetries = 0  // retries of what's waiting since the link came up (main thread)
+    private val retryOutbox = Runnable {
+        if (p2p.connectedIp == null || outbox.count == 0 || linkRetries >= 6) return@Runnable
+        linkRetries++
+        Logs.i("retrying what's waiting (${outbox.count})")
+        flushOutbox()
+    }
+
     fun cancelOutbox(ids: List<Long>) = io.execute { ids.forEach { outbox.remove(it) }; main.post { updateServiceNotification() } }
 
     fun flushOutbox() {
@@ -847,9 +969,10 @@ class WinDropService : Service() {
         if (entries.isEmpty()) return
         flushing = true
         flushAbort = false
+        val gen = sendGen.get()
         for (e in entries) {
             queued.incrementAndGet()
-            sender.execute { process(OutgoingItem.fromOutbox(e)) }
+            sender.execute { process(OutgoingItem.fromOutbox(e), gen = gen) }
         }
         sender.execute { flushing = false; flushAbort = false }
     }
@@ -915,7 +1038,7 @@ class WinDropService : Service() {
 
     /** A nearby (unpaired) PC has something for us: only while we're visible, and the user decides. */
     private fun handleOpen(c: Socket, raw: DataInputStream) {
-        if (!visible) {
+        if (!visibleOrJustEnded) {
             Logs.w("nearby: refused a PC: not visible to nearby PCs")
             c.getOutputStream().apply { write(Crypto.STATUS_REFUSED); flush() }
             return
@@ -965,7 +1088,7 @@ class WinDropService : Service() {
             onTextReceived(bytes.toString(Charsets.UTF_8))
             return
         }
-        receiveFile(name, offer.size, inp, out)
+        receiveFile(name, offer.size, inp, out, c, stranger ?: prefs.pcLabel)
     }
 
 
@@ -1001,7 +1124,7 @@ class WinDropService : Service() {
         getSystemService(NotificationManager::class.java).notify(NOTIF_OFFER, n)
     }
 
-    private fun receiveFile(name: String, size: Long, inp: DataInputStream, out: java.io.OutputStream) {
+    private fun receiveFile(name: String, size: Long, inp: DataInputStream, out: java.io.OutputStream, sock: java.net.Socket, from: String) {
         val ext = name.substringAfterLast('.', "").lowercase()
         val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
         val values = ContentValues().apply {
@@ -1014,9 +1137,11 @@ class WinDropService : Service() {
         if (uri == null) { out.write(Proto.ACK_BAD); return }
         xferTotal = size
         xferDone = 0
-        startProgress(name, false)
+        startProgress(name, false, from)
         main.post { island.transferStarted(false, name, false) }
         var ok = false
+        recvCancelled = false
+        recvSocket = sock
         try {
             contentResolver.openOutputStream(uri)!!.use { dst ->
                 val buf = ByteArray(Proto.CHUNK)
@@ -1031,28 +1156,32 @@ class WinDropService : Service() {
                 ok = left == 0L
             }
         } catch (e: IOException) {
-            Logs.w("receive failed", e)
+            if (!recvCancelled) Logs.w("receive failed", e)
+        } finally {
+            recvSocket = null
         }
+        val cancelled = recvCancelled && !ok
+        recvCancelled = false
         if (ok) {
             contentResolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
         } else {
             contentResolver.delete(uri, null, null)
         }
         runCatching { out.write(if (ok) Proto.ACK_OK else Proto.ACK_BAD); out.flush() }
-        Logs.i("received $name: ${if (ok) "ok" else "incomplete"}")
+        Logs.i("received $name: ${if (ok) "ok" else if (cancelled) "cancelled" else "incomplete"}")
         endProgress()
         main.post {
             island.transferEnded()
             if (ok) {
                 val open = { openFolder() }
-                if (island.attached) island.showMessage(Island.Msg("Saved to WinDrop — tap to show", name, Island.G_CHECK, Island.GREEN, onClick = open), 3000)
+                if (island.attached) island.showMessage(Island.Msg("Saved to WinDrop", name, Island.G_CHECK, Island.GREEN, onClick = open, action = "Show"), 3000)
                 postReceivedNotification(name, uri, mime)
                 // Copied on the PC: put it on this clipboard too, ready to paste.
                 if (name.startsWith("Clipboard ") && mime.startsWith("image/")) {
                     getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newUri(contentResolver, "From PC", uri))
                     Logs.i("clipboard: image from PC copied")
                 }
-            } else if (island.attached) {
+            } else if (island.attached && !cancelled) {
                 island.showMessage(Island.Msg("Transfer failed", name, Island.G_WARN, Island.RED), 3000)
             }
         }
@@ -1092,9 +1221,10 @@ class WinDropService : Service() {
             island.showMessage(
                 Island.Msg(
                     if (url != null) "Link from PC — copied" else "Text from PC — copied",
-                    if (url != null) "$preview  (tap to open)" else preview,
+                    preview,
                     if (url != null) Island.G_LINK else Island.G_CHECK, Island.BLUE,
                     onClick = url?.let { { runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } } },
+                    action = "Open link",
                 ),
                 3500,
             )
@@ -1277,11 +1407,12 @@ class WinDropService : Service() {
         if (now - lastIncompatibleAt < 60_000) return
         lastIncompatibleAt = now
         if (peer.older) {
-            ui(Island.Msg("The PC's WinDrop is out of date", "It has v${peer.version}. On the PC: tray icon → Update", Island.G_WARN, Island.AMBER),
+            ui(Island.Msg("The PC's WinDrop is out of date", "It has v${peer.version}. On the PC: WinDrop window, Settings, Update", Island.G_WARN, Island.AMBER),
                 5000, "Update WinDrop on the PC (it has v${peer.version})")
         } else {
-            ui(Island.Msg("This WinDrop app is out of date", "The PC has v${peer.version}. Tap to update", Island.G_WARN, Island.AMBER,
-                onClick = { startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra(MainActivity.EXTRA_UPDATE, true)) }),
+            ui(Island.Msg("This WinDrop app is out of date", "The PC has v${peer.version}", Island.G_WARN, Island.AMBER,
+                onClick = { startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra(MainActivity.EXTRA_UPDATE, true)) },
+                action = "Update"),
                 5000, "Update WinDrop on this phone (the PC has v${peer.version})")
             io.execute { Updater.check(this, notify = true, force = true) }
         }
@@ -1295,4 +1426,26 @@ class WinDropService : Service() {
     private fun toast(s: String) = main.post { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
 
     fun overlayAllowed() = Settings.canDrawOverlays(this)
+
+    /** The chooser was swiped up: ask in a notification instead (one action per PC, up to 3). */
+    fun showChooserNotification(title: String, targets: List<Pair<String, String>>) {
+        fun pick(code: Int, id: String?) = PendingIntent.getService(
+            this, code,
+            Intent(this, WinDropService::class.java).setAction(ACTION_PICK).apply { if (id != null) putExtra(EXTRA_TARGET, id) },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val b = Notification.Builder(this, CH_OFFERS)
+            .setSmallIcon(R.drawable.ic_windrop_glyph)
+            .setContentTitle(title)
+            .setContentText(if (targets.isEmpty()) "Looking for nearby PCs\u2026" else "Pick where it goes \u00b7 swipe away to not send it")
+            .setOnlyAlertOnce(true)
+            .setTimeoutAfter(60_000)
+            .setDeleteIntent(pick(30, null))  // swiped away: not sent
+        targets.take(3).forEachIndexed { i, (id, label) ->
+            b.addAction(Notification.Action.Builder(null, label.substringBefore(" \u00B7"), pick(31 + i, id)).build())
+        }
+        getSystemService(NotificationManager::class.java).notify(NOTIF_CHOOSE, b.build())
+    }
+
+    fun closeChooserNotification() = getSystemService(NotificationManager::class.java).cancel(NOTIF_CHOOSE)
 }

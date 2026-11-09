@@ -48,7 +48,11 @@ class TopOverlay {
     std::vector<Btn> buttons;
     bool stack = false;     // buttons as full-width rows under the title (the "send to which phone" list)
     bool expanded = false;  // tall: the whole title wrapped, buttons in a row underneath
+    bool multi = false;     // tall: several transfers at once, a row and a bar for each
     float titleH = 0;       // expanded: height of the wrapped title, DIPs
+    // A request that runs out by itself: a blue line goes round inside the edge from the top
+    // centre, all the way round when the time is up.
+    ULONGLONG ringFrom = 0, ringTo = 0;
   };
   struct Message {
     bool active = false;
@@ -71,6 +75,7 @@ class TopOverlay {
   void OnButton(int id);
   void OnBodyClick();
   int HitButton(POINT pt) const;
+  bool Transferring() const;  // a transfer is still running (others may have just ended)
   float Scale() const;
   void SetClickThrough(bool on);
   void Dismiss();  // the user pushed the pill away
@@ -117,6 +122,7 @@ class TopOverlay {
     uint64_t id = 0;
     std::wstring name, sender;
     uint64_t size = 0;
+    ULONGLONG since = 0, until = 0;  // asked at, answered "no" by itself at
   } offer_;
   struct {
     bool active = false;

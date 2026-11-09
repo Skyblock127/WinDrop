@@ -30,6 +30,7 @@ constexpr float kBandW = 720, kBandH = 130;
 constexpr int kBtnAccept = 1, kBtnDecline = 2, kBtnCancelOutbox = 3, kBtnAcceptAll = 4, kBtnDeclineAll = 5,
               kBtnPick = 100;  // + row
 constexpr ULONGLONG kFadeMs = 160;
+constexpr size_t kMaxRows = 4;  // transfers listed on the pill at once; the rest as "+ N more"
 
 // Solid, non-purple palette.
 constexpr uint32_t kBg = 0xF51E1E1E;
@@ -57,6 +58,37 @@ void AddRoundRect(Gdiplus::GraphicsPath& p, float x, float y, float w, float h, 
   p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
   p.AddArc(x, y + h - d, d, d, 90, 90);
   p.CloseFigure();
+}
+
+// The part of a rounded rectangle's outline that starts at its top centre and runs clockwise,
+// `frac` of the way round.
+void AddOutlinePart(Gdiplus::GraphicsPath& p, float x, float y, float w, float h, float r, float frac) {
+  r = max(0.f, min(r, min(w, h) / 2));
+  float sw = max(0.f, w - 2 * r), sh = max(0.f, h - 2 * r), arc = 3.14159265f * r / 2;
+  float left = std::clamp(frac, 0.f, 1.f) * (2 * sw + 2 * sh + 4 * arc);
+  auto line = [&](float x0, float y0, float x1, float y1, float len) {
+    if (left <= 0) return;
+    if (len > 0) {
+      float t = min(1.f, left / len);
+      p.AddLine(x0, y0, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+    }
+    left -= len;
+  };
+  auto corner = [&](float ax, float ay, float start) {
+    if (left <= 0 || r <= 0) return;
+    p.AddArc(ax, ay, 2 * r, 2 * r, start, 90 * min(1.f, left / arc));
+    left -= arc;
+  };
+  float cx = x + w / 2;
+  line(cx, y, x + w - r, y, sw / 2);
+  corner(x + w - 2 * r, y, 270);
+  line(x + w, y + r, x + w, y + h - r, sh);
+  corner(x + w - 2 * r, y + h - 2 * r, 0);
+  line(x + w - r, y + h, x + r, y + h, sw);
+  corner(x, y + h - 2 * r, 90);
+  line(x, y + h - r, x, y + r, sh);
+  corner(x, y, 180);
+  line(x + r, y, cx, y, sw / 2);
 }
 
 // Tick and cross drawn as strokes: icon-font glyphs sit off-centre in their em box.
@@ -386,7 +418,14 @@ void TopOverlay::UpdateChooser() {
     else Notify(L"Not sent", L"No phone was picked");
     return;
   }
-  auto ids = Targets();
+  // Rows keep their places while it asks: a phone that comes along goes at the end, one that's gone
+  // drops out, and nothing moves under the pointer (the default phone can change meanwhile).
+  auto now = Targets();
+  std::vector<std::string> ids;
+  for (auto& id : choose_.ids)
+    if (std::find(now.begin(), now.end(), id) != now.end()) ids.push_back(id);
+  for (auto& id : now)
+    if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
   if (ids != choose_.ids) { choose_.ids = ids; Refresh(); }
 }
 
@@ -441,6 +480,9 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       offer_.name = e.name;
       offer_.sender = e.path;
       offer_.size = e.size;
+      offer_.since = GetTickCount64();
+      offer_.until = offer_.since + NetworkEngine::kOfferWaitSec * 1000ull;
+      offerExpanded_ = false;  // every request starts small; a click shows the whole name
       Refresh();
       break;
     case NetEv::OfferClosed:
@@ -458,7 +500,7 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       Refresh();
       break;
     case NetEv::SendDone: {
-      xfer_.active = false;
+      xfer_.active = Transferring();
       Message m;
       m.title = L"Sent " + e.name;
       m.sub = L"Delivered to " + PhoneLabel(e.phone);
@@ -468,7 +510,7 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       break;
     }
     case NetEv::RecvDone: {
-      xfer_.active = false;
+      xfer_.active = Transferring();
       Message m;
       m.title = L"Received " + e.name;
       m.sub = L"Click to open folder";
@@ -479,13 +521,14 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       break;
     }
     case NetEv::TextReceived: {
-      xfer_.active = false;
+      xfer_.active = Transferring();
       std::wstring t = U2W(e.text);
       bool url = LooksLikeUrl(t);
       std::wstring preview = t.substr(0, t.find_first_of(L"\r\n"));
       if (preview.size() > 90) preview = preview.substr(0, 90) + L"…";
       Message m;
-      m.title = url ? L"Link from phone — copied" : L"Text from phone — copied";
+      std::wstring from = e.name.empty() ? L"phone" : e.name;
+      m.title = (url ? L"Link from " : L"Text from ") + from + L" — copied";
       m.sub = url ? preview + L"  (click to open)" : preview;
       m.glyph = url ? kGlyphLink : kGlyphCopy;
       m.accent = kBlue;
@@ -520,7 +563,7 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       break;
     }
     case NetEv::Declined: {
-      xfer_.active = false;
+      xfer_.active = Transferring();
       Message m;
       m.title = PhoneLabel(e.phone) + L" declined " + e.name;
       m.glyph = kGlyphCancel;
@@ -538,7 +581,7 @@ void TopOverlay::OnNetEvent(const UiEvent& e) {
       break;
     }
     case NetEv::Failed: {
-      xfer_.active = false;
+      xfer_.active = Transferring();
       Message m;
       m.title = e.text.empty() ? L"Transfer failed" : U2W(e.text);
       m.sub = e.text.empty() ? e.name : e.name + L" wasn't sent";
@@ -598,6 +641,8 @@ void TopOverlay::OnBodyClick() {
   Refresh();
 }
 
+bool TopOverlay::Transferring() const { return net_->sendingNow + net_->receivingNow > 0; }
+
 int TopOverlay::HitButton(POINT pt) const {
   for (auto& b : look_.buttons)
     if (PtInRect(&b.rc, pt)) return b.id;
@@ -631,22 +676,24 @@ void TopOverlay::Refresh() {
     L.glyph = kGlyphDown;
     L.accent = kBlue;
     L.clickable = true;
+    L.ringFrom = offer_.since;
+    L.ringTo = offer_.until;
     if (offerExpanded_) {
-      // The whole name, wrapped, and labelled buttons underneath.
+      // The whole name, wrapped, and labelled buttons in one row underneath ("... all": the rest
+      // from this sender too).
       L.expanded = true;
       Gdiplus::Graphics g(memDC_);
       Gdiplus::Font f(L"Segoe UI Semibold", 14, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
       Gdiplus::RectF box;
       g.MeasureString(L.title.c_str(), -1, &f, Gdiplus::RectF(0, 0, L.w - 14 - 36 - 12 - 14, 2000), nullptr, &box);
       L.titleH = std::clamp(box.Height, 20.f, 120.f);
-      // "... all" (the rest from this sender too) on its own row above.
-      L.h = 16 + L.titleH + 4 + 18 + 14 + 32 + 8 + 32 + 14;
+      L.h = 14 + L.titleH + 4 + 18 + 14 + 32 + 14;
       L.buttons.push_back({L"Decline all", kBtnDeclineAll, kGrayBtn});
-      L.buttons.push_back({L"Accept all", kBtnAcceptAll, kGrayBtn});
       L.buttons.push_back({L"Decline", kBtnDecline, kGrayBtn});
       L.buttons.push_back({L"Accept", kBtnAccept, kBlue});
+      L.buttons.push_back({L"Accept all", kBtnAcceptAll, kGrayBtn});
     } else {
-      L.h = 72;
+      L.h = 64;
       L.buttons.push_back({L"", kBtnDecline, kGrayBtn, kGlyphCancel});
       L.buttons.push_back({L"", kBtnAccept, kBlue, kGlyphCheck});
     }
@@ -664,18 +711,6 @@ void TopOverlay::Refresh() {
       L.buttons.push_back({PhoneLabel(id) + (IsNearbyId(id) ? L" · nearby" : L" · paired"), kBtnPick + (int)i, kGrayBtn});
     }
     L.h = 64 + 46.f * L.buttons.size() + (L.buttons.empty() ? 0 : 6);
-  } else if (xfer_.active && !xferHidden_ && pillShown_) {
-    L.idle = false;
-    L.w = 380;
-    L.h = 64;
-    L.y = 10;
-    if (xfer_.sending)
-      L.title = (xfer_.fromOutbox ? L"Phone is back — sending " : L"Sending ") + xfer_.name;
-    else
-      L.title = L"Receiving " + xfer_.name;
-    L.glyph = xfer_.sending ? kGlyphUp : kGlyphDown;
-    L.accent = kBlue;
-    L.progress = true;
   } else if (msg_.active && pillShown_) {
     L.idle = false;
     L.w = msg_.buttons.empty() ? 380.f : 440.f;
@@ -687,6 +722,28 @@ void TopOverlay::Refresh() {
     L.accent = msg_.accent;
     L.buttons = msg_.buttons;
     L.clickable = !msg_.openPath.empty();
+  } else if (xfer_.active && !xferHidden_ && pillShown_) {
+    L.idle = false;
+    L.w = 380;
+    L.h = 64;
+    L.y = 10;
+    auto now = net_->Transfers();
+    size_t sends = std::count_if(now.begin(), now.end(), [](const NetworkEngine::Running& r) { return r.sending; });
+    bool sending = now.empty() ? xfer_.sending : sends * 2 >= now.size();
+    if (now.size() > 1) {  // several at once: a row and a bar for each, under a total
+      L.title = sends && sends < now.size() ? std::to_wstring(now.size()) + L" transfers"
+                                            : (sends ? L"Sending " : L"Receiving ") + std::to_wstring(now.size()) + L" files";
+      L.multi = true;
+      L.w = 420;
+      L.h = 64 + 36.f * min<size_t>(now.size(), kMaxRows) + (now.size() > kMaxRows ? 18.f : 0.f) + 6;
+    } else {
+      std::wstring name = now.empty() ? xfer_.name : now[0].name;
+      bool back = sending && xfer_.fromOutbox && name == xfer_.name;
+      L.title = (!sending ? L"Receiving " : back ? L"Phone is back — sending " : L"Sending ") + name;
+    }
+    L.glyph = sending ? kGlyphUp : kGlyphDown;
+    L.accent = kBlue;
+    L.progress = true;
   }
   // New content fades in; the size animates by itself.
   std::wstring key = L.title + L"\x1f" + L.sub + L"\x1f" + std::to_wstring(L.buttons.size()) + (L.expanded ? L"e" : L"");
@@ -743,7 +800,7 @@ void TopOverlay::Tick() {
     return;
   }
   if (visible_) Render();
-  if (settled && !look_.progress) {
+  if (settled && !look_.progress && !look_.ringTo) {
     KillTimer(hwnd_, kAnimTimer);
     animating_ = false;
   }
@@ -780,8 +837,42 @@ void TopOverlay::DrawTall(Gdiplus::Graphics& g, int W, int H, float s, float ca,
     y = top + look_.titleH * s + 4 * s;
     g.DrawString(look_.sub.c_str(), -1, F.sub.get(), RectF(tx, y, tw, 18 * s), &one, &gray);
   } else {
+    std::wstring sub = look_.multi ? HumanSize(net_->xferDone) + L" of " + HumanSize(net_->xferTotal) : look_.sub;
     g.DrawString(look_.title.c_str(), -1, F.title.get(), RectF(tx, top + d / 2 - 20 * s, tw, 20 * s), &one, &white);
-    g.DrawString(look_.sub.c_str(), -1, F.sub.get(), RectF(tx, top + d / 2 + 1 * s, tw, 18 * s), &one, &gray);
+    g.DrawString(sub.c_str(), -1, F.sub.get(), RectF(tx, top + d / 2 + 1 * s, tw, 18 * s), &one, &gray);
+  }
+  if (look_.multi) {
+    // One row per transfer: who and what, its percentage, and its own bar.
+    auto now = net_->Transfers();
+    StringFormat rf;
+    rf.SetAlignment(StringAlignmentFar);
+    rf.SetLineAlignment(StringAlignmentCenter);
+    float ry = 64 * s, pw = 44 * s, rw = W - 2 * pad;
+    for (size_t i = 0; i < now.size() && i < kMaxRows; ++i) {
+      auto& t = now[i];
+      double frac = t.total ? std::clamp((double)t.done / t.total, 0.0, 1.0) : 1.0;
+      std::wstring who = (t.sending ? L"To " : L"From ") + t.phone + L" \u00b7 " + t.name;
+      wchar_t pct[16];
+      swprintf(pct, 16, L"%d%%", (int)(frac * 100));
+      g.DrawString(who.c_str(), -1, F.sub.get(), RectF(pad, ry, rw - pw, 18 * s), &one, &white);
+      g.DrawString(pct, -1, F.sub.get(), RectF(pad + rw - pw, ry, pw, 18 * s), &rf, &gray);
+      float by = ry + 22 * s, bh = 4 * s;
+      GraphicsPath track, fillp;
+      AddRoundRect(track, pad, by, rw, bh, bh / 2);
+      SolidBrush tb(Fade(0x40FFFFFF, ca));
+      g.FillPath(&tb, &track);
+      if (frac > 0) {
+        AddRoundRect(fillp, pad, by, max(bh, (float)(rw * frac)), bh, bh / 2);
+        SolidBrush pb(Fade(kBlue, ca));
+        g.FillPath(&pb, &fillp);
+      }
+      ry += 36 * s;
+    }
+    if (now.size() > kMaxRows) {
+      std::wstring more = L"+ " + std::to_wstring(now.size() - kMaxRows) + L" more";
+      g.DrawString(more.c_str(), -1, F.tiny.get(), RectF(pad, ry, rw, 16 * s), &one, &gray);
+    }
+    return;
   }
   if (look_.stack) {
     // One full-width row per choice.
@@ -805,21 +896,18 @@ void TopOverlay::DrawTall(Gdiplus::Graphics& g, int W, int H, float s, float ca,
     }
     return;
   }
-  // Expanded: buttons right-aligned in rows of two along the bottom, the last pair lowest.
-  float right = W - pad, bh = 32 * s, by = H - 14 * s - bh;
+  // Expanded: the buttons share one row along the bottom.
+  size_t n = max<size_t>(1, look_.buttons.size());
+  float gap = 8 * s, bh = 32 * s, by = H - 14 * s - bh;
+  float bw = (W - 2 * pad - gap * (n - 1)) / n;
   StringFormat bf;
   bf.SetAlignment(StringAlignmentCenter);
   bf.SetLineAlignment(StringAlignmentCenter);
-  for (int i = (int)look_.buttons.size() - 1; i >= 0; --i) {
-    if (i % 2 == 1 && i + 1 < (int)look_.buttons.size()) {  // next row up
-      right = W - pad;
-      by -= bh + 8 * s;
-    }
+  bf.SetTrimming(StringTrimmingEllipsisCharacter);
+  bf.SetFormatFlags(StringFormatFlagsNoWrap);
+  for (size_t i = 0; i < look_.buttons.size(); ++i) {
     auto& b = look_.buttons[i];
-    RectF m;
-    g.MeasureString(b.label.c_str(), -1, F.btn.get(), PointF(0, 0), &m);
-    float bw = m.Width + 36 * s;
-    RectF r(right - bw, by, bw, bh);
+    RectF r(pad + i * (bw + gap), by, bw, bh);
     GraphicsPath bp;
     AddRoundRect(bp, r.X, r.Y, r.Width, r.Height, bh / 2);
     uint32_t fill = b.fill;
@@ -828,7 +916,6 @@ void TopOverlay::DrawTall(Gdiplus::Graphics& g, int W, int H, float s, float ca,
     g.FillPath(&fb, &bp);
     g.DrawString(b.label.c_str(), -1, F.btn.get(), r, &bf, &white);
     b.rc = RECT{(LONG)r.X + px, (LONG)r.Y + py, (LONG)(r.X + r.Width) + px, (LONG)(r.Y + r.Height) + py};
-    right -= bw + 8 * s;
   }
 }
 
@@ -879,8 +966,11 @@ void TopOverlay::Render() {
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
 
+    // Single-row pills have fully round ends; the tall ones get rounded corners.
+    bool tall = look_.stack || look_.expanded || look_.multi;
+    float radius = tall ? min(H / 2.f, 30 * s) : H / 2.f;
     GraphicsPath pill;
-    AddRoundRect(pill, 0.5f, 0.5f, W - 1.f, H - 1.f, min(H / 2.f, 30 * s));
+    AddRoundRect(pill, 0.5f, 0.5f, W - 1.f, H - 1.f, radius);
     SolidBrush bg(Fade(kBg, 1));
     g.FillPath(&bg, &pill);
     Pen border(look_.highlight ? Fade(look_.accent, 1) : Color(40, 255, 255, 255), look_.highlight ? 2 * s : 1 * s);
@@ -891,7 +981,19 @@ void TopOverlay::Render() {
     ca *= std::clamp((cw_ - look_.w * 0.6f) / (look_.w * 0.4f), 0.f, 1.f);
     ca *= std::clamp((GetTickCount64() - fadeAt_) / (float)kFadeMs, 0.f, 1.f);
     for (auto& b : look_.buttons) b.rc = RECT{};
-    if (ca > 0.05f && !look_.idle && (look_.stack || look_.expanded)) {
+    if (ca > 0.05f && !look_.idle && look_.ringTo > look_.ringFrom) {
+      ULONGLONG now = GetTickCount64();
+      float frac = (float)(min(now, look_.ringTo) - min(now, look_.ringFrom)) / (float)(look_.ringTo - look_.ringFrom);
+      float ins = 3 * s;
+      GraphicsPath part;
+      AddOutlinePart(part, ins, ins, W - 2 * ins, H - 2 * ins, radius - ins, frac);
+      Pen ring(Fade(kBlue, ca), 2.5f * s);
+      ring.SetStartCap(LineCapRound);
+      ring.SetEndCap(LineCapRound);
+      ring.SetLineJoin(LineJoinRound);
+      if (frac > 0.002f) g.DrawPath(&ring, &part);
+    }
+    if (ca > 0.05f && !look_.idle && tall) {
       DrawTall(g, W, H, s, ca, px, py);
     } else if (ca > 0.05f && !look_.idle) {
       auto& F = FontsFor(s);

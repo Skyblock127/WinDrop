@@ -24,7 +24,7 @@ struct AppView {
   ULONGLONG pairingLeftMs = 0, pairingTotalMs = 1;  // the pairing window is open
   struct Phone {
     std::string id;
-    std::wstring name, sub;
+    std::wstring name;
     bool linked = false;
   };
   std::vector<Phone> phones;
@@ -34,6 +34,12 @@ struct AppView {
     std::wstring label, sub;
   };
   std::vector<Item> queue;          // waiting to send
+  struct Transfer {
+    std::wstring label, sub;  // the file; "To Pixel · 12.0 MB of 450 MB"
+    float frac = 0;
+    bool sending = true;
+  };
+  std::vector<Transfer> transfers;  // under way right now
   std::wstring version;             // "Version 0.3.0 · up to date"
   std::wstring updateLabel;         // "Check for updates" / "Update to 0.3.1" / "Checking…"
   bool updateReady = false, updateBusy = false;
@@ -43,7 +49,7 @@ struct AppView {
 
 enum class AppAct {
   On, Pill, Startup, Visible, SendClip, OpenDir, Pair, PairStop, PairYes, PairNo, RemovePhone, CancelItem,
-  CancelAll, Update, SaveLogs, ClearLogs, Quit
+  Update, SaveLogs, ClearLogs, Quit
 };
 
 class AppWindow {
@@ -96,7 +102,7 @@ class AppWindow {
   float s_ = 1;
   float contentH_ = 0, scroll_ = 0;
   int clientH_ = 0;
-  bool anchoredBottom_ = true;  // grows upward from above the tray until the user moves it
+  bool centred_ = true;  // opens in the middle of the screen and stays centred as it grows, until moved
   bool placed_ = false;
   // Hover / press, by what the hit is (indices change on every render).
   int hoverKind_ = 0, pressKind_ = 0;

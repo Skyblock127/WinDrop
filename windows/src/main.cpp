@@ -401,7 +401,7 @@ AppView BuildView() {
   v.pillShown = Cfg().pillShown;
   v.startup = StartupEnabled();
   auto phones = Phones();
-  std::string linked = TheWifiDirect().LinkedPhone();
+  std::vector<std::string> linked = TheWifiDirect().LinkedPhones();
   std::wstring off = TheRadios().OffText();
   if (!v.on) {
     v.status = L"Off";
@@ -410,7 +410,7 @@ AppView BuildView() {
     v.status = L"On \u00b7 " + off;
     v.statusColor = 0xFFF5A524;
   } else if (!linked.empty()) {
-    v.status = L"Connected to " + PhoneLabel(linked);
+    v.status = linked.size() == 1 ? L"Connected to " + PhoneLabel(linked[0]) : L"Connected to " + std::to_wstring(linked.size()) + L" phones";
     v.statusColor = 0xFF2BB673;
   } else if (phones.empty()) {
     v.status = L"On \u00b7 no phone paired";
@@ -435,10 +435,7 @@ AppView BuildView() {
     AppView::Phone ph;
     ph.id = p.id;
     ph.name = p.name.empty() ? L"Phone" : p.name;
-    ph.linked = p.id == linked;
-    size_t n = std::count_if(queue.begin(), queue.end(), [&](const OutboxItem& o) { return o.phoneId == p.id; });
-    ph.sub = ph.linked ? L"Connected" : L"Paired";
-    if (n) ph.sub += L" \u00b7 " + std::to_wstring(n) + L" waiting";
+    ph.linked = std::find(linked.begin(), linked.end(), p.id) != linked.end();
     v.phones.push_back(ph);
   }
   v.maxPhones = kMaxPhones;
@@ -458,8 +455,17 @@ AppView BuildView() {
     else if (GetFileAttributesExW(it.path.c_str(), GetFileExInfoStandard, &fa))
       item.sub = HumanSize((uint64_t(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow);
     else item.sub = L"File";
-    if (phones.size() > 1) item.sub += L" \u00b7 for " + PhoneLabel(it.phoneId);
+    item.sub += L" \u00b7 to " + PhoneLabel(it.phoneId);
     v.queue.push_back(item);
+  }
+
+  for (auto& t : gNet.Transfers()) {
+    AppView::Transfer x;
+    x.label = t.name;
+    x.sending = t.sending;
+    x.frac = t.total ? float(double(t.done) / double(t.total)) : 1.f;
+    x.sub = (t.sending ? L"To " : L"From ") + t.phone + L" \u00b7 " + HumanSize(t.done) + L" of " + HumanSize(t.total);
+    v.transfers.push_back(x);
   }
 
   std::wstring ver = U2W(WINDROP_VERSION);
@@ -513,7 +519,8 @@ void RemovePhone(const std::string& id) {
     Cfg().RemovePhone(id);
     Cfg().Save();
   }
-  if (TheWifiDirect().LinkedPhone() == id) TheWifiDirect().Disconnect();
+  std::string ip = TheWifiDirect().IpOf(id);
+  if (!ip.empty()) TheWifiDirect().Disconnect(ip);
   Log("ui: removed phone %s", W2U(name).c_str());
   UpdateTray();
   gOverlay.Notify(L"Removed " + name, L"Pair it again from the WinDrop window to use it");
@@ -629,7 +636,6 @@ void AppAction(AppAct a, uint64_t num, const std::string& id) {
     case AppAct::PairNo: AnswerPair(num, a == AppAct::PairYes); break;
     case AppAct::RemovePhone: RemovePhone(id); break;
     case AppAct::CancelItem: CancelItem(num); break;
-    case AppAct::CancelAll: OnCommand(IDM_QUEUE_CLEAR); break;
     case AppAct::Update:
       if (gUpdate.version.empty()) {
         gUpdateNote.clear();

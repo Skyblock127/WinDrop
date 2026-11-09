@@ -256,11 +256,14 @@ void AppWindow::Hide() {
   page_ = Page::Home;
   scroll_ = 0;
   confirmRemove_.clear();
+  placed_ = false;  // opens in the middle again next time
 }
 
 void AppWindow::Refresh() {
   if (!hwnd_ || !IsWindowVisible(hwnd_)) return;
   v_ = state_();
+  // Bars move: refresh more often while something is under way.
+  SetTimer(hwnd_, kTickTimer, v_.transfers.empty() ? 1000 : 400, nullptr);
   if (page_ == Page::Waiting && v_.queue.empty()) page_ = Page::Home;
   if (!confirmRemove_.empty() &&
       std::none_of(v_.phones.begin(), v_.phones.end(), [&](const AppView::Phone& p) { return p.id == confirmRemove_; }))
@@ -273,8 +276,8 @@ void AppWindow::SetAlwaysOnTop(bool on) {
   if (hwnd_) SetWindowPos(hwnd_, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-// Sizes the window to its content (scrolling only past the screen's height). It opens above the
-// tray and grows upward from there, until it's moved.
+// Sizes the window to its content (scrolling only past the screen's height). It opens in the middle
+// of the screen and stays centred as its content changes, until it's moved.
 void AppWindow::Fit() {
   UINT dpi = GetDpiForWindow(hwnd_);
   s_ = dpi / 96.f;
@@ -306,13 +309,13 @@ void AppWindow::Fit() {
   GetWindowRect(hwnd_, &wr);
   int x, y;
   if (!placed_) {
-    x = work.right - ww - margin;
-    y = work.bottom - wh - margin;
+    x = (work.left + work.right - ww) / 2;
+    y = (work.top + work.bottom - wh) / 2;
     placed_ = true;
-    anchoredBottom_ = true;
+    centred_ = true;
   } else {
     x = wr.left;
-    y = anchoredBottom_ ? wr.bottom - wh : wr.top;
+    y = centred_ ? (wr.top + wr.bottom - wh) / 2 : wr.top;
   }
   x = max<int>(work.left, min<int>(x, work.right - ww));
   y = max<int>(work.top, min<int>(y, work.bottom - wh));
@@ -418,6 +421,24 @@ float AppWindow::Home(Paint& p, float y) {
     y += h + gap;
   }
 
+  // Under way right now: each with its own bar.
+  if (!v_.transfers.empty()) {
+    float h = kPad + 22 + v_.transfers.size() * (58 + 6) - 6 + kPad;
+    p.Card(y, h);
+    float cy = y + kPad;
+    p.Label(L"In progress", kAccent, cy, std::to_wstring(v_.transfers.size()));
+    cy += 22;
+    for (auto& t : v_.transfers) {
+      p.Round(kIn, cy, kInW, 58, 10, kField);
+      p.Text(t.label, f.body, kText, kIn + 12, cy + 6, kInW - 24 - 44, 19);
+      p.Text(std::to_wstring(int(t.frac * 100)) + L"%", f.sub, kMuted, kIn + kInW - 12 - 44, cy + 7, 44, 18, 2);
+      p.Text(t.sub, f.sub, kMuted, kIn + 12, cy + 25, kInW - 24, 16);
+      p.Bar(kIn + 12, cy + 46, kInW - 24, t.frac);
+      cy += 58 + 6;
+    }
+    y += h + gap;
+  }
+
   // Paired phones, and pairing.
   {
     bool pairing = v_.pairingLeftMs > 0;
@@ -426,7 +447,7 @@ float AppWindow::Home(Paint& p, float y) {
     std::wstring emptyNote = L"No phone paired yet. Pair one to send to it whenever it's in reach.";
     float h = kPad + 22;
     if (v_.phones.empty()) h += p.TextH(emptyNote, f.body, kInW) + 10;
-    for (auto& ph : v_.phones) h += (ph.id == confirmRemove_ ? 12 + 20 + 4 + noteH + 10 + 36 + 12 : 52) + 6;
+    for (auto& ph : v_.phones) h += (ph.id == confirmRemove_ ? 12 + 20 + 4 + noteH + 10 + 36 + 12 : 44) + 6;
     h += 4 + (pairing ? 74 : 40) + kPad;
     p.Card(y, h);
     float cy = y + kPad;
@@ -449,12 +470,13 @@ float AppWindow::Home(Paint& p, float y) {
         cy += rh + 6;
         continue;
       }
-      p.Round(kIn, cy, kInW, 52, 12, kField);
-      p.Circle(kIn + 18, cy + 26, 4, ph.linked ? 0xFF2BB673 : kTrackOff);
-      p.Text(ph.name, f.title, kText, kIn + 32, cy + 7, kInW - 32 - 48, 20);
-      p.Text(ph.sub, f.sub, kMuted, kIn + 32, cy + 27, kInW - 32 - 48, 18);
-      p.IconButton(kIn + kInW - 42, cy + 10, 32, kGlyphX, kAskRemove, 0, ph.id);
-      cy += 52 + 6;
+      p.Round(kIn, cy, kInW, 44, 12, kField);
+      p.Circle(kIn + 18, cy + 22, 4, ph.linked ? 0xFF2BB673 : kTrackOff);
+      float tagW = ph.linked ? 78.f : 0.f;
+      p.Text(ph.name, f.title, kText, kIn + 32, cy + 12, kInW - 32 - 48 - tagW, 20);
+      if (ph.linked) p.Text(L"Connected", f.sub, 0xFF2BB673, kIn + kInW - 46 - tagW, cy + 13, tagW, 18, 2);
+      p.IconButton(kIn + kInW - 42, cy + 6, 32, kGlyphX, kAskRemove, 0, ph.id);
+      cy += 44 + 6;
     }
     cy += 4;
     p.enabled = v_.on || pairing;
@@ -479,7 +501,8 @@ float AppWindow::Home(Paint& p, float y) {
   // Waiting to send: the first few, the rest on their own page.
   if (!v_.queue.empty()) {
     size_t shown = min<size_t>(v_.queue.size(), 3);
-    float h = kPad + 22 + 20 + shown * (46 + 6) + 4 + 40 + kPad;
+    bool more = v_.queue.size() > shown;
+    float h = kPad + 22 + 20 + shown * (46 + 6) + (more ? 4 + 40 : -6) + kPad;
     p.Card(y, h);
     float cy = y + kPad;
     p.Label(L"Waiting to send", kAmber, cy, std::to_wstring(v_.queue.size()));
@@ -494,14 +517,7 @@ float AppWindow::Home(Paint& p, float y) {
       p.IconButton(kIn + kInW - 40, cy + 7, 32, kGlyphX, Act(AppAct::CancelItem), it.id);
       cy += 46 + 6;
     }
-    cy += 4;
-    if (v_.queue.size() > shown) {
-      float bw = (kInW - 8) / 2;
-      p.Button(kIn, cy, bw, 40, L"Show all " + std::to_wstring(v_.queue.size()), 0, kGoWaiting);
-      p.Button(kIn + bw + 8, cy, bw, 40, L"Cancel all", 0, Act(AppAct::CancelAll));
-    } else {
-      p.Button(kIn, cy, kInW, 40, v_.queue.size() == 1 ? L"Cancel it" : L"Cancel all", 0, Act(AppAct::CancelAll));
-    }
+    if (more) p.Button(kIn, cy + 4, kInW, 40, L"Show all " + std::to_wstring(v_.queue.size()), 0, kGoWaiting);
     y += h + gap;
   }
   return y;
@@ -552,7 +568,7 @@ float AppWindow::SettingsPage(Paint& p, float y) {
 
 float AppWindow::WaitingPage(Paint& p, float y) {
   auto& f = p.f();
-  float h = kPad + 20 + v_.queue.size() * (46 + 6) + 4 + 40 + kPad;
+  float h = kPad + 20 + v_.queue.size() * (46 + 6) - 6 + kPad;
   p.Card(y, h);
   float cy = y + kPad;
   p.Text(L"Goes out by itself when the phone is in reach.", f.sub, kMuted, kIn, cy, kInW, 16);
@@ -564,8 +580,6 @@ float AppWindow::WaitingPage(Paint& p, float y) {
     p.IconButton(kIn + kInW - 40, cy + 7, 32, kGlyphX, Act(AppAct::CancelItem), it.id);
     cy += 46 + 6;
   }
-  cy += 4;
-  p.Button(kIn, cy, kInW, 40, L"Cancel all", 0, Act(AppAct::CancelAll));
   return y + h + 12;
 }
 
@@ -642,7 +656,7 @@ LRESULT AppWindow::Handle(UINT m, WPARAM w, LPARAM l) {
       if (LOWORD(w) == WA_INACTIVE) deactivatedAt_ = GetTickCount64();
       break;
     case WM_EXITSIZEMOVE:
-      anchoredBottom_ = false;  // moved by the user: stays where they put it
+      centred_ = false;  // moved by the user: stays where they put it
       return 0;
     case WM_DPICHANGED: {
       auto r = (RECT*)l;

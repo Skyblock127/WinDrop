@@ -20,13 +20,22 @@ class WifiDirectHost {
   void Stop();
   bool Running() const { return running_; }
   std::wstring Status();
-  std::string PeerIp();  // phone's address on the Wi-Fi Direct link, empty when not connected
-  void Disconnect();     // tear our side of the link down now (the phone said bye)
+  // Phones on our Wi-Fi Direct group. This PC owns the group, so several phones can be on it at
+  // once, each at its own address; one phone's link coming or going never touches another's.
+  std::string PeerIp();  // the newest link's phone address, empty when no phone is on
+  bool HasPeer(const std::string& ip);
+  std::string IpOf(const std::string& phoneId);  // where that paired phone is, once it has proven itself
+  std::vector<std::string> UnprovenIps();        // links that haven't said who they are yet, newest first
+  bool IsUnproven(const std::string& ip);
+  bool FreshLink(const std::string& ip);         // came up moments ago: the phone may still be setting up
+  // The same, with each link's LinkSeq(), so a caller can tell a link it tried from a new one.
+  std::vector<std::pair<uint64_t, std::string>> UnprovenLinks();
+  std::vector<std::string> LinkedPhones();       // the paired phones on the group
+  void Disconnect(const std::string& ip);        // close that phone's link (empty: every link)
   // A link to `ip` just came up (its request arrived at `since`): it has kAuthGraceMs to prove it's
   // a paired phone. A proof that raced ahead of this call (from `ip`, after `since`) counts.
   void LinkUp(ULONGLONG since, const std::string& ip);
   void MarkAuthenticated(const std::string& phoneId, const std::string& ip);
-  std::string LinkedPhone();  // the paired phone on the link, empty if none (or not proven yet)
   // Transfers in progress over the link; a busy link isn't handed to another phone.
   std::atomic<int> busy{0};
   // Pairing and unpaired ("nearby") exchanges in progress: the link isn't dropped for lacking a
@@ -47,8 +56,8 @@ class WifiDirectHost {
   void OpenPairWindow();  // also forgets rejected phones: they may be the one being paired
   void ClosePairWindow();  // a phone just paired, or "Stop pairing"
   void Refresh();         // re-publish now, so a phone searching for us finds us at once
-  // The phone on the link isn't paired here: drop it and ignore its requests for 10 minutes.
-  void RejectPeer();
+  // The phone at `ip` isn't paired here: drop it and ignore its requests for 10 minutes.
+  void RejectPeer(const std::string& ip);
   bool Pairing() const { return GetTickCount64() < pairUntil_; }
   ULONGLONG PairingLeftMs() const { ULONGLONG now = GetTickCount64(); return now < pairUntil_ ? pairUntil_ - now : 0; }
   static constexpr ULONGLONG kPairWindowMs = 180000;
@@ -61,10 +70,17 @@ class WifiDirectHost {
   bool Visible() const { return GetTickCount64() < visibleUntil_; }
   ULONGLONG VisibleLeftMs() const { ULONGLONG now = GetTickCount64(); return now < visibleUntil_ ? visibleUntil_ - now : 0; }
   static constexpr ULONGLONG kVisibleMs = 600000;
+  // Once the 10 minutes run out by themselves (not switched off), a phone that picked this PC just
+  // before still gets through for this long. New phones can't pick it: its beacon is off by then.
+  static constexpr ULONGLONG kVisibleGraceMs = 60000;
+  bool VisibleOrJustEnded() const {
+    ULONGLONG until = visibleUntil_;
+    return until && GetTickCount64() < until + kVisibleGraceMs;
+  }
   void SetNearbyBeacon(const std::vector<uint8_t>& callTag);  // ticker: call that phone, else say we're visible, else off
   bool Calling() const { return calling_; }
   // A phone we don't have a key for may join now (pairing, visible, or we called it).
-  bool OpenToStrangers() const { return Pairing() || Visible() || calling_; }
+  bool OpenToStrangers() const { return Pairing() || VisibleOrJustEnded() || calling_; }
   uint64_t LinkSeq() const { return linkSeq_; }  // changes with every new link
   // A drag is heading for the pill: wake the phone before the drop so the link is ready by then.
   void Prewarm(const std::string& phoneId) {
@@ -83,6 +99,10 @@ class WifiDirectHost {
   std::function<void()> onUnreachable;
   void SawConnection(const std::string& ip);  // a TCP connection arrived from this address
   void PhoneFoundUs();  // a phone asked to connect: keep advertising the way it found us
+  // A phone's join failed / worked. Joins that keep failing in listen mode get a minute of
+  // advertising as group owner (some phones only rejoin a group they know), kept if a phone comes.
+  void JoinFailed();
+  void JoinWorked();
   bool AsGroupOwner() const { return asGroupOwner_; }
 
 
@@ -90,6 +110,8 @@ class WifiDirectHost {
   void Loop();
 
   std::atomic<bool> asGroupOwner_{false};  // how the current advertisement runs
+  std::atomic<ULONGLONG> goTrialUntil_{0};  // trying group owner after failed joins, until then
+  ULONGLONG failedJoinAt_ = 0;              // the last failed join in listen mode; under mx_
   std::atomic<ULONGLONG> pairFrom_{0};     // when "Pair phone…" was opened; turns count from here
   uint8_t beaconFlags_ = 0;                // pairing beacon flags sent (bit 0: Wi-Fi off); under mx_
   std::atomic<bool> beaconBroken_{false};
@@ -101,11 +123,11 @@ class WifiDirectHost {
   std::atomic<bool> running_{false};
   std::wstring status_ = L"off";
   Beacon beacon_ = kBeaconOff;
-  std::string beaconPhone_, authedPhone_, prewarmPhone_;
+  std::string beaconPhone_, prewarmPhone_;
   bool refresh_ = false;  // re-publish now (fresh listen state) because we're about to need the phone
   std::atomic<ULONGLONG> pairUntil_{0};
   int64_t beaconWindow_ = 0;
-  std::atomic<uint64_t> linkSeq_{0}, authedSeq_{0}, sawConnSeq_{0};
+  std::atomic<uint64_t> linkSeq_{0};
   // Last proof / connection by address, under mx_ (see LinkUp).
   std::string lastAuthIp_, lastAuthPhone_, lastSawIp_;
   ULONGLONG lastAuthAt_ = 0, lastSawAt_ = 0;
